@@ -5,7 +5,7 @@ from environment.simulation import simulate_infections_n_classrooms  # Assuming 
 import itertools
 class MultiClassroomEnv(ParallelEnv):
     def __init__(self, num_classrooms=1, total_students=100, s_shared=10, max_weeks=2, action_levels_per_class=None,
-                 alpha=0.005, beta=0.01, gamma=0.5, seed=None):
+                 alpha=0.005, beta=0.01, gamma=0.2, seed=None):
         self.num_classrooms = num_classrooms
         self.total_students = total_students
         self.s_shared = s_shared
