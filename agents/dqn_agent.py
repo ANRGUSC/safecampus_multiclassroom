@@ -7,7 +7,6 @@ from tqdm import tqdm
 import matplotlib.pyplot as plt
 import os
 
-
 # Define the neural network architecture for DQN
 class DQNetwork(nn.Module):
     def __init__(self, input_dim, action_space_size):
@@ -21,10 +20,9 @@ class DQNetwork(nn.Module):
         x = torch.relu(self.fc2(x))
         return self.fc3(x)  # Output Q-values for each action
 
-
 class DQNAgent:
-    def __init__(self, agents, state_dim, action_space_size, learning_rate=0.001, discount_factor=0.99,
-                 epsilon=1.0, epsilon_decay=0.995, min_epsilon=0.00001, batch_size=64, memory_size=10000):
+    def __init__(self, agents, state_dim, action_space_size, learning_rate=0.0001, discount_factor=0.99,
+                 epsilon=1.0, epsilon_decay=0.995, min_epsilon=0.000001, batch_size=64, memory_size=10000):
         self.agents = agents
         self.state_dim = state_dim
         self.action_space_size = action_space_size
@@ -36,11 +34,10 @@ class DQNAgent:
         self.batch_size = batch_size
         self.memory_size = memory_size
         self.memory = []  # Replay buffer
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         # Initialize networks for each agent
-        self.networks = {agent: DQNetwork(state_dim, action_space_size).to(self.device) for agent in agents}
-        self.target_networks = {agent: DQNetwork(state_dim, action_space_size).to(self.device) for agent in agents}
+        self.networks = {agent: DQNetwork(state_dim, action_space_size) for agent in agents}
+        self.target_networks = {agent: DQNetwork(state_dim, action_space_size) for agent in agents}
         self.optimizers = {agent: optim.Adam(self.networks[agent].parameters(), lr=learning_rate) for agent in agents}
 
         # Initialize target networks to have the same weights as the primary networks
@@ -55,7 +52,7 @@ class DQNAgent:
         if random.random() < self.epsilon:
             return random.randint(0, self.action_space_size - 1)  # Random action (exploration)
         else:
-            state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)  # Convert state to tensor
+            state_tensor = torch.FloatTensor(state).unsqueeze(0)  # Convert state to tensor
             q_values = self.networks[agent](state_tensor)  # Get Q-values from the network
             return torch.argmax(q_values).item()  # Return the action with the highest Q-value
 
@@ -74,15 +71,15 @@ class DQNAgent:
         if len(self.memory) < self.batch_size:
             return  # Not enough experiences to sample a batch
 
+        # Sample a batch of experiences
         experiences = self.sample_experiences()
         batch_agent, batch_state, batch_action, batch_reward, batch_next_state, batch_done = zip(*experiences)
 
-        batch_state = torch.FloatTensor(np.array(batch_state)).to(self.device)
-
-        batch_action = torch.LongTensor(batch_action).unsqueeze(1).to(self.device)
-        batch_reward = torch.FloatTensor(batch_reward).to(self.device)
-        batch_next_state = torch.FloatTensor(np.array(batch_next_state)).to(self.device)
-        batch_done = torch.FloatTensor(batch_done).to(self.device)
+        batch_state = torch.FloatTensor(np.array(batch_state))
+        batch_action = torch.LongTensor(batch_action).unsqueeze(1)
+        batch_reward = torch.FloatTensor(batch_reward)
+        batch_next_state = torch.FloatTensor(np.array(batch_next_state))
+        batch_done = torch.FloatTensor(batch_done)
 
         # Compute the current Q-values using the primary network
         current_q_values = self.networks[agent](batch_state).gather(1, batch_action).squeeze()
@@ -90,7 +87,7 @@ class DQNAgent:
         # Compute the target Q-values using the target network
         with torch.no_grad():
             max_next_q_values = self.target_networks[agent](batch_next_state).max(1)[0]
-            target_q_values = batch_reward + (1 - batch_done) * max_next_q_values
+            target_q_values = batch_reward + (1 - batch_done) * self.discount_factor * max_next_q_values
 
         # Compute the loss between current and target Q-values
         loss = nn.MSELoss()(current_q_values, target_q_values)
@@ -105,8 +102,8 @@ class DQNAgent:
         self.target_networks[agent].load_state_dict(self.networks[agent].state_dict())
 
     def train(self, env, max_steps=30, update_target_steps=100):
-        pbar = tqdm(total=500, desc="Training Progress", leave=True)
-        for episode in range(500):
+        pbar = tqdm(total=1000, desc="Training Progress", leave=True)
+        for episode in range(1000):
             states = env.reset()
             total_rewards = {agent: 0 for agent in self.agents}
 
@@ -129,7 +126,6 @@ class DQNAgent:
 
             # Update epsilon (exploration rate) using polynomial decay
             self.epsilon = max(self.min_epsilon, self.epsilon * self.epsilon_decay)
-            # self.epsilon = self.min_epsilon + (1.0 - self.min_epsilon) * (1 - episode / 5000) ** 2
 
             # Update target networks periodically
             if episode % update_target_steps == 0:
@@ -144,7 +140,7 @@ class DQNAgent:
 
         pbar.close()
         rewards_path = f"results/avg_rewards_dqn_{env.gamma}.png"
-        self.plot_rewards()
+        self.plot_rewards(rewards_path)
 
     def plot_rewards(self, save_path="results/avg_rewards_dqn.png"):
         """Plot average rewards over training episodes for each agent."""

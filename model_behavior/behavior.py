@@ -8,8 +8,8 @@ num_classrooms = 5  # Number of classrooms
 time_steps = 30  # Simulation duration (in time steps)
 
 # Transmission rates (can be adjusted)
-phi = 2  # Within-classroom transmission rate
-beta = 0.001  # Community transmission rate
+phi = 0.005  # Within-classroom transmission rate
+beta = 0.01  # Community transmission rate
 
 # Community risk values for each classroom over time (randomized for simulation)
 np.random.seed(42)  # For reproducibility
@@ -330,68 +330,70 @@ def plot_threshold_behavior_alpha_beta():
     plt.show()
 
 
+def plot_phase_diagram_stochastic(phi, beta, max_students, community_risk, num_trajectories=5, num_steps=50):
+    """
+    Plot a stochastic phase diagram showing infected vs allowed students with random community risk over time.
 
-def plot_phase_diagram(phi, beta, max_students, community_risk):
-    def system_ode(X, t, phi, beta, c):
-        u, i = X
-        if u > 0:
-            alpha = max(0, phi * i / u + beta * c - i / u)
-            du = 0  # Assume allowed students remain constant
-            di = (u - i) * alpha - i  # Include recovery term
-        else:
-            du, di = 0, 0
-        return [du, di]
+    Arguments:
+    phi -- within-classroom transmission rate
+    beta -- community transmission rate
+    max_students -- maximum number of students per classroom
+    community_risk -- community risk values (used to simulate randomness)
+    num_trajectories -- number of trajectories to simulate (default: 5)
+    num_steps -- number of steps for each trajectory (default: 50)
+    """
 
-    def nullcline_i(u):
-        return u * (1 - 1 / (phi + beta * c))
-
-    def R0_curve(u):
-        return u * (1 - 1 / (phi * u + beta * c * u))
-
-    # Set up the phase space
+    # Initialize the phase space grid
     u_range = np.linspace(0, max_students, 100)
     i_range = np.linspace(0, max_students, 100)
     u_grid, i_grid = np.meshgrid(u_range, i_range)
 
-    # Calculate the derivatives
-    c = np.mean(community_risk)  # Use mean community risk
-    du_di = np.zeros((2,) + u_grid.shape)
-    for i in range(u_grid.shape[0]):
-        for j in range(u_grid.shape[1]):
-            du_di[:, i, j] = system_ode([u_grid[i, j], i_grid[i, j]], 0, phi, beta, c)
+    def stochastic_step(u, i, phi, beta, c):
+        """
+        Perform one stochastic step based on current allowed students (u), infected students (i),
+        transmission rates (phi, beta), and community risk (c).
+        """
+        if u > 0:
+            # Introduce randomness in community risk for each step
+            c_random = np.random.uniform(0, 1) * c
+            alpha = max(0, phi * i / u + beta * c_random - i / u)
+            delta_i = (u - i) * alpha - i  # Infection increment with recovery term
+            i_new = i + delta_i
+            i_new = max(0, min(i_new, u))  # Ensure infected doesn't exceed allowed or fall below 0
+        else:
+            i_new = 0
+
+        return u, i_new
 
     # Create the phase plot
     plt.figure(figsize=(12, 10))
 
-    # Plot the streamlines
-    stream = plt.streamplot(u_grid, i_grid, du_di[0], du_di[1], density=1.5, color='lightblue',
-                            arrowsize=1.5, linewidth=0.5, arrowstyle='->')
-
-    # Plot nullclines
-    plt.plot(u_range, nullcline_i(u_range), 'r--', label='I Nullcline')
-    plt.axvline(0, color='g', linestyle='--', label='U Nullcline')
-
-    # Plot R0 = 1 curve
-    plt.plot(u_range, R0_curve(u_range), 'k-.', label='R0 = 1')
-
-    # Simulate and plot some trajectories
-    num_trajectories = 5
+    # Simulate and plot trajectories
     colors = plt.cm.jet(np.linspace(0, 1, num_trajectories))
 
     for idx, color in enumerate(colors):
-        u_0 = np.random.uniform(max_students / 2, max_students)
-        i_0 = np.random.uniform(0, u_0 / 2)
+        u_0 = np.random.uniform(max_students / 2, max_students)  # Random initial allowed students
+        i_0 = np.random.uniform(0, u_0 / 2)  # Random initial infected students
+        u, i = u_0, i_0
 
-        t = np.linspace(0, 50, 1000)
-        solution = odeint(system_ode, [u_0, i_0], t, args=(phi, beta, c))
+        # Track the trajectory
+        trajectory_u = [u_0]
+        trajectory_i = [i_0]
 
-        plt.plot(solution[:, 0], solution[:, 1], '-', color=color, linewidth=2,
-                 label=f'Trajectory {idx + 1}')
+        for step in range(num_steps):
+            u, i = stochastic_step(u, i, phi, beta, np.mean(community_risk))
+            trajectory_u.append(u)
+            trajectory_i.append(i)
+
+        # Plot the trajectory
+        plt.plot(trajectory_u, trajectory_i, '-', color=color, linewidth=2, label=f'Trajectory {idx + 1}')
         plt.plot([u_0], [i_0], 'o', color=color, markersize=8)  # Mark starting point
 
+    # Add labels and legend
     plt.xlabel('Allowed Students')
     plt.ylabel('Infected Students')
-    plt.title(f'Phase Diagram: Infected vs. Allowed Students\nφ={phi:.4f}, β={beta:.4f}, c={c:.2f}')
+    plt.title(
+        f'Stochastic Phase Diagram: Infected vs. Allowed Students\nφ={phi:.4f}, β={beta:.4f}, c={np.mean(community_risk):.2f}')
     plt.xlim(0, max_students)
     plt.ylim(0, max_students)
     plt.grid(True, linestyle='--', alpha=0.7)
@@ -401,14 +403,14 @@ def plot_phase_diagram(phi, beta, max_students, community_risk):
 
     plt.legend(loc='center left', bbox_to_anchor=(1, 0.5))
     plt.tight_layout()
-    plt.savefig("phase_diagram.png")
+    plt.savefig("stochastic_phase_diagram.png")
     plt.show()
 
 
 max_students = 100
 
 
-plot_phase_diagram(phi, beta, max_students, community_risk)
+plot_phase_diagram_stochastic(phi, beta, max_students, community_risk)
 P, states = simulate_transition_matrix()
 
 # Run the simulation and plot the threshold behavior

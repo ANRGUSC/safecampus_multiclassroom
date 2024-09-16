@@ -1,14 +1,17 @@
 from environment.multiclassroom import MultiClassroomEnv
 from agents.dqn_agent import DQNAgent
 from agents.q_learning import IndependentQLearningAgent
+from agents.a2c_agent import A2CAgent
+from agents.ppo_agent import PPOAgent
+from utils.visualization import visualize_all_states, visualize_all_states_dqn, visualize_all_states_ppo
 from utils.visualization import visualize_all_states, visualize_all_states_dqn
 import numpy as np
 import itertools
-def q_learning_run():
+def q_learning_run(gamma=0.2):
     # Ensure the number of classrooms and action levels match
     num_classrooms = 3  # Example with 2 classrooms
     env = MultiClassroomEnv(num_classrooms=num_classrooms, total_students=100, s_shared=10, max_weeks=52,
-                            action_levels_per_class=[3, 3, 3], seed=42)  # Only 2 action levels for 2 classrooms
+                            action_levels_per_class=[3, 3, 3], seed=42, gamma=gamma)  # Only 2 action levels for 2 classrooms
 
     # Define the agents
     agents = [f'classroom_{i}' for i in range(num_classrooms)]  # Matching number of classrooms
@@ -52,16 +55,16 @@ def q_learning_run():
                 # Print the state and the selected action
                 print(f"State (Infected: {infected}, Community Risk: {community_risk:.2f}) -> Action: {action}")
 
-        agent.visualize_q_table(agent_name)
+        # agent.visualize_q_table(agent_name)
 
         save_path = f"./results/{agent_name}_q_learning_all_states_{env.gamma}.png"
         plot_path = visualize_all_states(agent_name, env, agent.q_tables, save_path=save_path)
         print(f"All States visualization saved at {plot_path}")
-def dqn_run():
+def dqn_run(gamma=0.2):
     # Ensure the number of classrooms and action levels match
     num_classrooms = 2  # Example with 2 classrooms
     env = MultiClassroomEnv(num_classrooms=num_classrooms, total_students=100, s_shared=10, max_weeks=52,
-                            action_levels_per_class=[3, 3], seed=42)  # Only 2 action levels for 2 classrooms
+                            action_levels_per_class=[3, 3], seed=42, gamma=gamma)  # Only 2 action levels for 2 classrooms
 
     # Define the agents
     agents = [f'classroom_{i}' for i in range(num_classrooms)]  # Matching number of classrooms
@@ -105,12 +108,137 @@ def dqn_run():
         plot_path = visualize_all_states_dqn(agent_name, env, agent, save_path=save_path)
         print(f"All States visualization saved at {plot_path}")
 
-def main():
-    # Run the Q-learning example
-    # q_learning_run()
 
-    # Run the DQN example
-    dqn_run()
+def a2c_run(gamma=0.2):
+    # Ensure the number of classrooms and action levels match
+    num_classrooms = 2  # Example with 2 classrooms
+    env = MultiClassroomEnv(num_classrooms=num_classrooms, total_students=100, s_shared=10, max_weeks=52,
+                            action_levels_per_class=[3, 3], seed=42, gamma=gamma)  # Only 2 action levels for 2 classrooms
+
+    # Define the agents
+    agents = [f'classroom_{i}' for i in range(num_classrooms)]  # Matching number of classrooms
+
+    # Action space is discrete, based on the environment's action space
+    action_space_size = env.action_spaces[agents[0]].n
+
+    # State dimension is 2 (infected, community_risk)
+    state_dim = 2
+
+    # Initialize the A2C agent
+    agent = A2CAgent(agents, state_dim, action_space_size)
+
+    # Train the agent in the environment
+    agent.train(env, max_steps=52)
+
+    # Test the trained model by printing the actions for specific state combinations
+    print("\nTesting the trained model on specific state combinations of infected and community risk:")
+
+    # Define discrete values for infected and community risk for testing
+    infected_test_values = np.linspace(0, 100, num=10).astype(int)  # 10 evenly spaced values from 0 to 100
+    community_risk_test_values = np.linspace(0.0, 1.0, num=10)  # 10 evenly spaced values from 0 to 1
+
+    # Iterate through the agents to test their learned policy
+    for agent_name in agents:
+        print(f"\nActions for {agent_name}:")
+
+        # Iterate over the combinations of infected values and community risk values
+        for infected in infected_test_values:
+            for community_risk in community_risk_test_values:
+                # Prepare state with matching input dimensions (infected, community_risk)
+                state = (infected, community_risk)
+
+                # Select action based on the actor network
+                action = agent.select_action(agent_name, state)
+
+                # Print the state and the selected action
+                print(f"State (Infected: {infected}, Community Risk: {community_risk:.2f}) -> Action: {action}")
+
+    # After testing, visualize the learned policies for all states
+    for agent_name in agents:
+        save_path = f"./results/{agent_name}_all_states_a2c_{env.gamma}.png"
+        plot_path = visualize_all_states_dqn(agent_name, env, agent, save_path=save_path)
+        print(f"All States visualization saved at {plot_path}")
+
+import itertools
+
+def ppo_run(gamma=0.2):
+    # Define environment parameters
+    num_classrooms = 2  # Example with 2 classrooms
+    env = MultiClassroomEnv(
+        num_classrooms=num_classrooms,
+        total_students=100,
+        s_shared=10,
+        max_weeks=52,
+        action_levels_per_class=[3, 3],  # Example with 3 discrete actions per classroom
+        seed=42,
+        gamma=gamma
+    )
+
+    # Define the agents
+    agents = [f'classroom_{i}' for i in range(num_classrooms)]
+
+    # Generate the full state space: all combinations of infected values (0, 10, ..., 100) and community risk values (0, 0.1, ..., 1.0)
+    infected_values = range(0, 101, 10)  # Discretized infected values: 0, 10, 20, ..., 100
+    community_risk_values = [i / 10 for i in range(11)]  # Discretized community risk values: 0, 0.1, ..., 1.0
+    state_space = list(itertools.product(infected_values, community_risk_values))  # All state combinations
+
+    # Define the state dimension based on the environment's observation space
+    state_dim = env.observation_spaces[agents[0]].shape[0]  # 2D (infected, community risk)
+
+    # Define action space size (discrete actions)
+    action_space_size = env.action_spaces[agents[0]].n
+
+    # Initialize the PPO agent
+    agent = PPOAgent(
+        agents=agents,
+        state_dim=state_dim,
+        action_space_size=action_space_size,
+        learning_rate=0.01,  # Example learning rate
+        discount_factor=0.99,  # Example discount factor
+        clip_epsilon=0.2  # PPO clipping epsilon
+    )
+
+    # Train the agent in the environment
+    agent.train(env, max_steps=52)  # 52 steps per episode (weeks)
+
+    # Test the trained model by printing the actions for specific state combinations
+    print("\nTesting the trained model on specific state combinations of infected and community risk:")
+
+    # Define discrete values for infected and community risk for testing
+    infected_test_values = np.linspace(0, 100, num=10).astype(int)  # 10 evenly spaced values from 0 to 100
+    community_risk_test_values = np.linspace(0.0, 1.0, num=10)  # 10 evenly spaced values from 0 to 1
+
+    for agent_name in agents:
+        print(f"\nActions for {agent_name}:")
+        for infected in infected_test_values:
+            for community_risk in community_risk_test_values:
+                state = np.array([infected, community_risk])
+                action = agent.select_action(agent_name, state)
+                print(f"State (Infected: {infected}, Community Risk: {community_risk:.2f}) -> Action: {action}")
+
+    # Visualize the learned policy for all states
+    for agent_name in agents:
+        save_path = f"./results/{agent_name}_all_states_ppo_{env.gamma}.png"
+        plot_path = visualize_all_states_ppo(agent_name, env, agent, save_path=save_path)
+        print(f"Policy visualization saved at {plot_path}")
+
+def main():
+    # Define the gamma values to test
+    gamma_values = [0.2, 0.4, 0.5]
+
+    # Loop over each gamma value and run the training for each agent type
+    for gamma in gamma_values:
+        print(f"\nRunning Q-learning with gamma = {gamma}")
+        q_learning_run(gamma)
+
+        print(f"\nRunning DQN with gamma = {gamma}")
+        dqn_run(gamma)
+
+        # print(f"\nRunning A2C with gamma = {gamma}")
+        # a2c_run(gamma)
+
+        print(f"\nRunning PPO with gamma = {gamma}")
+        ppo_run(gamma)
 
 if __name__ == "__main__":
     main()

@@ -12,6 +12,111 @@ def generate_distinct_colors(n):
     RGB_tuples = list(map(lambda x: colorsys.hsv_to_rgb(*x), HSV_tuples))
     return ['#{:02x}{:02x}{:02x}'.format(int(r * 255), int(g * 255), int(b * 255)) for r, g, b in RGB_tuples]
 
+def visualize_all_states_ppo(agent, env, a2c_agent, save_path="results/policy_visualization.png"):
+    """
+    Visualize the learned policy for all states by displaying the best action for each state using distinct colors.
+    Args:
+        agent: The agent whose A2C model we are visualizing.
+        env: The environment object for access to the agent.
+        a2c_agent: The trained A2C agent.
+        save_path: Where to save the generated visualization.
+    """
+    # Generate distinct colors for the number of actions
+    action_colors = generate_distinct_colors(env.action_spaces[agent].n)
+
+    # Prepare to visualize
+    fig, ax = plt.subplots(figsize=(6, 6))
+
+    # Lists to store the visualization data
+    x_vals, y_vals, state_colors, actions = [], [], [], []
+
+    # Iterate through the state space
+    for state_tuple in env.state_space:
+        infected, community_risk = state_tuple
+        state = np.array([infected, community_risk])
+
+        # Find the best action from the A2C model for this state
+        best_action = a2c_agent.select_action(agent, state)  # Ensure this returns an integer
+
+        # Store values for plotting
+        x_vals.append(community_risk)  # Community risk as x-axis
+        y_vals.append(infected)  # Infected as y-axis
+        state_colors.append(action_colors[best_action])  # Assign color based on the best action
+        actions.append(best_action)  # Track action for color reference
+
+    # Plot the states with the corresponding actions using distinct colors
+    scatter = ax.scatter(x_vals, y_vals, c=state_colors, s=100, marker='s')
+
+    # Create a legend for the actions
+    legend_elements = [mpatches.Patch(facecolor=color, label=f'Action {i}') for i, color in enumerate(action_colors)]
+    ax.legend(handles=legend_elements, loc='upper right')
+
+    # Set plot labels and title
+    ax.set_xlabel("Community Risk (%)")
+    ax.set_ylabel("Infected Students")
+    ax.set_title(f"Learned Policy (Best Action) for All States - {agent}")
+
+    # Save the plot
+    if not os.path.exists(os.path.dirname(save_path)):
+        os.makedirs(os.path.dirname(save_path))
+    plt.savefig(save_path)
+    # plt.show()
+
+    print(f"Policy visualization saved at {save_path}")
+    return save_path
+
+def visualize_all_states_a2c(agent, env, a2c_agent, save_path="results/policy_visualization.png"):
+    """
+    Visualize the learned policy for all states by displaying the best action for each state using distinct colors.
+    Args:
+        agent: The agent whose A2C model we are visualizing.
+        env: The environment object for access to the agent.
+        a2c_agent: The trained A2C agent.
+        save_path: Where to save the generated visualization.
+    """
+    # Generate distinct colors for the number of actions
+    action_colors = generate_distinct_colors(env.action_spaces[agent].n)
+
+    # Prepare to visualize
+    fig, ax = plt.subplots(figsize=(6, 6))
+
+    # Lists to store the visualization data
+    x_vals, y_vals, state_colors, actions = [], [], [], []
+
+    # Iterate through the state space
+    for state_tuple in env.state_space:
+        infected, community_risk = state_tuple
+        state = np.array([infected, community_risk])
+
+        # Find the best action from the A2C model for this state
+        best_action = a2c_agent.select_action(agent, state)  # Ensure this returns an integer
+
+        # Store values for plotting
+        x_vals.append(community_risk)  # Community risk as x-axis
+        y_vals.append(infected)  # Infected as y-axis
+        state_colors.append(action_colors[best_action])  # Assign color based on the best action
+        actions.append(best_action)  # Track action for color reference
+
+    # Plot the states with the corresponding actions using distinct colors
+    scatter = ax.scatter(x_vals, y_vals, c=state_colors, s=100, marker='s')
+
+    # Create a legend for the actions
+    legend_elements = [mpatches.Patch(facecolor=color, label=f'Action {i}') for i, color in enumerate(action_colors)]
+    ax.legend(handles=legend_elements, loc='upper right')
+
+    # Set plot labels and title
+    ax.set_xlabel("Community Risk (%)")
+    ax.set_ylabel("Infected Students")
+    ax.set_title(f"Learned Policy (Best Action) for All States - {agent}")
+
+    # Save the plot
+    if not os.path.exists(os.path.dirname(save_path)):
+        os.makedirs(os.path.dirname(save_path))
+    plt.savefig(save_path)
+    # plt.show()
+
+    print(f"Policy visualization saved at {save_path}")
+    return save_path
 def visualize_all_states_dqn(agent, env, dqn_agent, save_path="results/policy_visualization.png"):
     """
     Visualize the learned policy for all states by displaying the best action for each state using distinct colors.
@@ -62,6 +167,9 @@ def visualize_all_states_dqn(agent, env, dqn_agent, save_path="results/policy_vi
         os.makedirs(os.path.dirname(save_path))
     plt.savefig(save_path)
     # plt.show()
+
+
+
 
     print(f"Policy visualization saved at {save_path}")
     return save_path
