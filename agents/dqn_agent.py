@@ -23,7 +23,7 @@ class DQNetwork(nn.Module):
 
 
 class DQNAgent:
-    def __init__(self, agents, state_dim, action_space_size, learning_rate=0.1, discount_factor=0.99,
+    def __init__(self, agents, state_dim, action_space_size, learning_rate=0.001, discount_factor=0.99,
                  epsilon=1.0, epsilon_decay=0.995, min_epsilon=0.00001, batch_size=64, memory_size=10000):
         self.agents = agents
         self.state_dim = state_dim
@@ -105,8 +105,8 @@ class DQNAgent:
         self.target_networks[agent].load_state_dict(self.networks[agent].state_dict())
 
     def train(self, env, max_steps=30, update_target_steps=100):
-        pbar = tqdm(total=1000, desc="Training Progress", leave=True)
-        for episode in range(1000):
+        pbar = tqdm(total=500, desc="Training Progress", leave=True)
+        for episode in range(500):
             states = env.reset()
             total_rewards = {agent: 0 for agent in self.agents}
 
@@ -128,8 +128,8 @@ class DQNAgent:
                     break
 
             # Update epsilon (exploration rate) using polynomial decay
-            # self.epsilon = max(self.min_epsilon, self.epsilon * self.epsilon_decay)
-            self.epsilon = self.min_epsilon + (1.0 - self.min_epsilon) * (1 - episode / 5000) ** 2
+            self.epsilon = max(self.min_epsilon, self.epsilon * self.epsilon_decay)
+            # self.epsilon = self.min_epsilon + (1.0 - self.min_epsilon) * (1 - episode / 5000) ** 2
 
             # Update target networks periodically
             if episode % update_target_steps == 0:
@@ -143,9 +143,10 @@ class DQNAgent:
             pbar.update(1)
 
         pbar.close()
+        rewards_path = f"results/avg_rewards_dqn_{env.gamma}.png"
         self.plot_rewards()
 
-    def plot_rewards(self, save_path="results/avg_rewards.png"):
+    def plot_rewards(self, save_path="results/avg_rewards_dqn.png"):
         """Plot average rewards over training episodes for each agent."""
         plt.figure(figsize=(10, 5))
 

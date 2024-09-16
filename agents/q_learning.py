@@ -107,9 +107,10 @@ class IndependentQLearningAgent:
             pbar.update(1)
 
         pbar.close()
-        self.plot_rewards()
+        rewards_path = f"results/avg_rewards_q_learning_{env.gamma}.png"
+        self.plot_rewards(save_path=rewards_path)
 
-    def plot_rewards(self, save_path="results/avg_rewards.png"):
+    def plot_rewards(self, save_path="results/avg_rewards_q_learning.png"):
         """Plot average rewards over training episodes for each agent."""
         plt.figure(figsize=(10, 5))
 
