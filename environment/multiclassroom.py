@@ -3,25 +3,24 @@ from pettingzoo.utils import ParallelEnv
 from gym.spaces import Discrete, Box
 from environment.simulation import simulate_infections_n_classrooms  # Assuming this is the correct location of the model
 import itertools
+import random
+
+
+
 class MultiClassroomEnv(ParallelEnv):
-    def __init__(self, num_classrooms=1, total_students=100, s_shared=10, max_weeks=2, action_levels_per_class=None,
-                 alpha=0.005, beta=0.01, gamma=0.2, seed=None):
+    def __init__(self, num_classrooms=1, total_students=100, max_weeks=2, action_levels_per_class=None,
+                 alpha=0.01, beta=0.001, phi=0.0000001, gamma=0.3, seed=None):
         self.num_classrooms = num_classrooms
         self.total_students = total_students
-        self.s_shared = s_shared
         self.max_weeks = max_weeks
-        self.gamma = gamma  # Weighting factor for reward function
+        self.phi = phi  # Cross-classroom transmission rate
+        self.gamma = gamma  # Weight for balancing allowed students and infections
         self.current_week = 0
         self.seed(seed)
-
-        # Ensure that action_levels_per_class matches the number of classrooms
-        if action_levels_per_class is None or len(action_levels_per_class) != num_classrooms:
-            raise ValueError(
-                f"The length of action_levels_per_class ({len(action_levels_per_class)}) must match the number of classrooms ({num_classrooms})")
+        self.episode_seed = 0
 
         # Infection rate (alpha) and community transmission rate (beta)
-        # Set alpha to 2 for all classrooms and beta to 0.001 for all classrooms
-        self.alpha = np.full(self.num_classrooms, alpha)
+        self.alpha_m = np.full(self.num_classrooms, alpha)
         self.beta = np.full(self.num_classrooms, beta)
 
         self.action_levels_per_class = action_levels_per_class
@@ -45,8 +44,8 @@ class MultiClassroomEnv(ParallelEnv):
         # Initialize infection and community risk states
         self.student_status = [0] * num_classrooms  # Number of currently infected students per classroom
         self.allowed_students = [0] * num_classrooms
-        self.shared_matrix = self._create_shared_matrix(num_classrooms, s_shared)
         self.community_risks = self._generate_episode_risks()
+
 
         # Define the state space: all combinations of infected students (0 to 100) and community risk (0 to 1)
         infected_values = range(0, self.total_students + 1, 10)  # Discretize infected students in steps of 10
@@ -56,17 +55,34 @@ class MultiClassroomEnv(ParallelEnv):
     def seed(self, seed=None):
         np.random.seed(seed)
 
-    def _create_shared_matrix(self, n, s_shared):
-        matrix = np.zeros((n, n))
-        for i in range(n):
-            for j in range(i + 1, n):
-                matrix[i][j] = s_shared
-                matrix[j][i] = s_shared
-        return matrix
-
     def _generate_episode_risks(self):
-        """Generate community risks for each classroom over the weeks."""
-        return np.random.uniform(0, 1, (self.num_classrooms, self.max_weeks))
+        """Generate unique community risks for each classroom over the weeks."""
+        self.episode_seed += 1
+        random.seed(self.episode_seed)
+        np.random.seed(self.episode_seed)
+
+        t = np.linspace(0, 2 * np.pi, self.max_weeks)
+        risk_patterns = np.zeros((self.num_classrooms, self.max_weeks))
+
+        for classroom in range(self.num_classrooms):
+            num_components = random.randint(1, 3)  # Use 1 to 3 sine components
+            risk_pattern = np.zeros(self.max_weeks)
+
+            # Generate the sine wave-based risk pattern
+            for _ in range(num_components):
+                amplitude = random.uniform(0.2, 0.4)
+                frequency = random.uniform(0.5, 2.0)
+                phase = random.uniform(0, 2 * np.pi)
+                risk_pattern += amplitude * np.sin(frequency * t + phase)
+
+            # Normalize and scale the risk pattern to range [0.0, 0.9]
+            risk_pattern = (risk_pattern - np.min(risk_pattern)) / (np.max(risk_pattern) - np.min(risk_pattern))
+            risk_pattern = 1.0 * risk_pattern + 0.0  # Scale to range [0.0, 0.9]
+
+            # Add some noise and clamp the values between 0.0 and 1.0
+            risk_patterns[classroom] = [max(0.1, min(1.0, risk + random.uniform(-0.1, 0.1))) for risk in risk_pattern]
+
+        return risk_patterns
 
     def get_state_index(self, state):
         """
@@ -95,30 +111,43 @@ class MultiClassroomEnv(ParallelEnv):
 
     def step(self, actions):
         # Convert actions to the appropriate allowed_students value
-        self.allowed_students = [self._map_action_to_allowed_students(actions[agent], i) for i, agent in enumerate(self.agents)]
+        self.allowed_students = [self._map_action_to_allowed_students(actions[agent], i) for i, agent in
+                                 enumerate(self.agents)]
 
         # Ensure that current_week does not exceed max_weeks
         current_week_index = min(self.current_week, self.max_weeks - 1)
+        lambda1 = 0.3 # Penalty for deviation in infected students
+        lambda2 = 0.5
 
         # Simulate infections using the updated model
         self.student_status = simulate_infections_n_classrooms(
             self.num_classrooms,
-            self.shared_matrix,  # The matrix governing shared infections
-            self.alpha,  # In-class infection rates (set to 2 for all)
-            self.beta,  # Community infection rates (set to 0.001 for all)
+            self.alpha_m,  # In-class infection rates
+            self.beta,  # Community infection rates
+            self.phi,  # Cross-classroom transmission rate
             self.student_status,  # Current infected students per classroom
             self.allowed_students,  # Allowed students per classroom
             self.community_risks[:, current_week_index]  # Community risk per classroom
         )
 
-        # Calculate rewards based on the number of allowed students and infections
-        rewards = {
-            f'classroom_{i}': (self.gamma * self.allowed_students[i]) - ((1 - self.gamma) * self.student_status[i])
-            for i in range(self.num_classrooms)
-        }
+        # Calculate rewards for each classroom
+        rewards = {}
+        for i, agent in enumerate(self.agents):
+            allowed_students = self.allowed_students[i]
+            infected_students = self.student_status[i]
+            # Calculate the reward using the fairness scheme
+            # reward = (self.gamma * allowed_students) - ((1 - self.gamma) * infected_students)
+            # Reward = balancing allowed students vs penalty on infections (quadratic)
+            reward = self.gamma * allowed_students - (1-self.gamma) * infected_students
+            rewards[agent] = reward
 
+        # Increment the week
         self.current_week += 1
-        dones = {f'classroom_{i}': self.current_week >= self.max_weeks for i in range(self.num_classrooms)}
+
+        # Check if the simulation is done (end of weeks)
+        dones = {agent: self.current_week >= self.max_weeks for agent in self.agents}
+
+        # Return observations, rewards, and done flags
         return self._get_observations(), rewards, dones, {}
 
     def _map_action_to_allowed_students(self, action, class_index):
@@ -127,7 +156,7 @@ class MultiClassroomEnv(ParallelEnv):
         return action * (self.total_students // (action_levels - 1))
 
     def _get_observations(self):
-        # Return observations including only infected students and community risk for each classroom
+        # Return observations including only infected students and unique community risk for each classroom
         return {
             agent: np.array(
                 [self.student_status[i], self.community_risks[i][min(self.current_week, self.max_weeks - 1)]])

@@ -175,14 +175,14 @@ def visualize_all_states_dqn(agent, env, dqn_agent, save_path="results/policy_vi
     return save_path
 
 
-
-def visualize_all_states(agent, env, q_tables, save_path="results/policy_visualization.png"):
+def visualize_all_states(agent, env, q1_tables, q2_tables, save_path="results/policy_visualization.png"):
     """
     Visualize the learned policy for all states by displaying the best action for each state using distinct colors.
     Args:
-        agent: The agent whose Q-table we are visualizing.
+        agent: The agent whose Q1 and Q2 tables we are visualizing.
         env: The environment object for access to the agent.
-        q_tables: The Q-table for the agent, with rows as state indices and columns as action indices.
+        q1_tables: The Q1-table for the agent, with rows as state indices and columns as action indices.
+        q2_tables: The Q2-table for the agent, with rows as state indices and columns as action indices.
         save_path: Where to save the generated visualization.
     """
     # Generate distinct colors for the number of actions
@@ -198,8 +198,10 @@ def visualize_all_states(agent, env, q_tables, save_path="results/policy_visuali
     for state_tuple in env.state_space:
         state_idx = env.get_state_index(state_tuple)  # Get the index of the current state
 
-        # Find the best action from the Q-table for this state
-        best_action = np.argmax(q_tables[agent][state_idx])
+        # Find the best action by summing the Q-values from both Q1 and Q2 tables
+        q_sum = q1_tables[agent][state_idx] + q2_tables[agent][state_idx]
+        best_action = np.argmax(q_sum)
+
         infected, community_risk = state_tuple
 
         # Store values for plotting
@@ -224,13 +226,9 @@ def visualize_all_states(agent, env, q_tables, save_path="results/policy_visuali
     if not os.path.exists(os.path.dirname(save_path)):
         os.makedirs(os.path.dirname(save_path))
     plt.savefig(save_path)
-    # plt.show()
 
     print(f"Policy visualization saved at {save_path}")
     return save_path
-
-
-
 
 
 def visualize_myopic_states(myopic_agent, env, alpha=0.4):

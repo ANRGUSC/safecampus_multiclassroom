@@ -1,16 +1,17 @@
 import numpy as np
+SEED = 42
+np.random.seed(SEED)
 
+def simulate_infections_n_classrooms(n_classes, alpha_m, beta, phi, current_infected, allowed_students, community_risk):
 
-def simulate_infections_n_classrooms(n_classes, shared_matrix, alpha, beta, current_infected, allowed_students,
-                                     community_risk):
     """
-    Simulate the number of new infections in each classroom.
+    Simulate the number of new infections in each classroom using the updated infection model.
 
     Args:
         n_classes: Number of classrooms.
-        shared_matrix: The matrix governing shared infections between classrooms.
-        alpha: In-class infection rate per classroom.
-        beta: Community infection rate per classroom.
+        alpha_m: In-class transmission rate.
+        beta: Community infection rate.
+        phi: Cross-classroom transmission rate.
         current_infected: List of current infected students per classroom.
         allowed_students: List of allowed students per classroom.
         community_risk: Community risk values for each classroom.
@@ -19,31 +20,40 @@ def simulate_infections_n_classrooms(n_classes, shared_matrix, alpha, beta, curr
         List of new infections per classroom.
     """
     new_infected = []
+
     for i in range(n_classes):
-        # In-class infections
-        in_class_infections = alpha[i] * current_infected[i] * allowed_students[i]
+        # Ensure that current_infected[i] and allowed_students[i] are scalar
+        current_infected_i = current_infected[i]
+        allowed_students_i = allowed_students[i]
+        community_risk_i = community_risk[i]  # Ensure this is a scalar for each classroom
+        # Within-classroom infections (scalar for each classroom)
+        in_class_term = alpha_m[i] * current_infected_i * allowed_students_i
+        # Community infections (scalar for each classroom)
+        community_term = beta[i] * community_risk_i * allowed_students_i ** 2
 
-        # Community infections
-        community_infections = beta[i] * community_risk[i] * allowed_students[i] ** 2
-
-        # Cross-class infections
+        # Cross-class infections (aggregate scalar)
         cross_class_infections = 0
         for j in range(n_classes):
             if i != j:
-                # Shared infection risk between classrooms
-                shared_infection_risk = 1 - (1 - alpha[i]) * (1 - alpha[j])
-                cross_class_infections += shared_matrix[i, j] * shared_infection_risk * current_infected[j]
+                cross_class_infections += phi * current_infected[j] * allowed_students[j]
 
-        # Total infected (capped by the number of allowed students)
-        total_infected = int(in_class_infections + community_infections + cross_class_infections)
-        total_infected = min(total_infected, allowed_students[i])
 
-        new_infected.append(total_infected)
+        # Total infected for this classroom (scalar for each classroom)
+        total_infected = in_class_term + community_term + cross_class_infections
+        # print(f'total_infected for class {i}: {total_infected}')  # Debugging output
+
+        # Ensure total_infected is capped by allowed_students and convert to integer
+        total_infected = np.minimum(total_infected, allowed_students_i)
+        # print("total_infected after capping:", total_infected)  # Debugging output
+        new_infected.append(int(total_infected))  # Convert scalar to integer for each classroom
 
     return new_infected
 
 
-# def simulate_random_actions(n_classes, shared_matrix, alpha, beta, community_risks, max_steps=20):
+
+
+
+# def simulate_random_actions(n_classes, alpha_m, beta, phi, community_risks, max_steps=20):
 #     """
 #     Simulate infections over time with random actions (number of allowed students) in each classroom.
 #     Allowed actions are restricted to the set {0, 50, 100}.
@@ -51,8 +61,9 @@ def simulate_infections_n_classrooms(n_classes, shared_matrix, alpha, beta, curr
 #     Args:
 #         n_classes: Number of classrooms.
 #         shared_matrix: Matrix of infection sharing between classrooms.
-#         alpha: In-class infection rate.
+#         alpha_m: In-class transmission rate.
 #         beta: Community infection rate.
+#         phi: Cross-classroom transmission rate.
 #         community_risks: Array of community risk values over time for each classroom.
 #         max_steps: Number of steps (weeks) to simulate.
 #
@@ -71,8 +82,9 @@ def simulate_infections_n_classrooms(n_classes, shared_matrix, alpha, beta, curr
 #         current_risks = community_risks[:, step]  # Community risks for the current step
 #
 #         # Simulate infections for this step
-#         new_infected = simulate_infections_n_classrooms(n_classes, shared_matrix, alpha, beta, current_infected,
-#                                                         allowed_students, current_risks)
+#         new_infected = simulate_infections_n_classrooms(
+#             n_classes, alpha_m, beta, phi, current_infected, allowed_students, current_risks
+#         )
 #
 #         # Update current infected with the new values
 #         current_infected = new_infected
@@ -86,12 +98,13 @@ def simulate_infections_n_classrooms(n_classes, shared_matrix, alpha, beta, curr
 #
 # # Example usage
 # if __name__ == "__main__":
-#     n_classes = 3  # Number of classrooms
+#     n_classes = 2  # Number of classrooms
 #     s_shared = 10  # Shared infections
-#     alpha = [0.005] * n_classes  # Infection rate
-#     beta = [0.01] * n_classes  # Community infection rate
+#     alpha_m = 0.005  # Infection rate per classroom
+#     beta = 0.01  # Community infection rate
+#     phi = 0.005  # Cross-classroom transmission rate
 #     community_risks = np.random.uniform(0, 1, (n_classes, 20))  # Simulate community risks for 20 steps
 #     shared_matrix = np.ones((n_classes, n_classes)) * s_shared  # Simple shared infection matrix
 #
 #     # Simulate with random actions from the set {0, 50, 100} for 20 steps
-#     simulate_random_actions(n_classes, shared_matrix, alpha, beta, community_risks, max_steps=20)
+#     simulate_random_actions(n_classes, alpha_m, beta, phi, community_risks, max_steps=20)

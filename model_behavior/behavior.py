@@ -1,428 +1,326 @@
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy import linalg
-from scipy.integrate import odeint
-# Parameters for the simulation
-max_students = 100  # Maximum number of students per classroom
-num_classrooms = 5  # Number of classrooms
-time_steps = 30  # Simulation duration (in time steps)
+from mpl_toolkits.mplot3d import Axes3D
+SEED = 42
+np.random.seed(SEED)
 
-# Transmission rates (can be adjusted)
-phi = 0.005  # Within-classroom transmission rate
-beta = 0.01  # Community transmission rate
+# Define the infection model function
+def infection_model(allowed_students, infected, community_risk, classroom_idx, alpha_m=2, beta=0.001, phi=0.005):
+    u_i = allowed_students[classroom_idx]  # Allowed students in the classroom
+    i_i = infected[classroom_idx]  # Current infected students in the classroom
+    c_i = community_risk[classroom_idx]  # Community risk for the classroom
 
-# Community risk values for each classroom over time (randomized for simulation)
-np.random.seed(42)  # For reproducibility
-community_risk = np.random.uniform(0.5, 1.0, (num_classrooms, time_steps))
+    # Within-classroom term
+    in_class_term = alpha_m * i_i * u_i
 
-# Number of students allowed in each classroom (assumed to be max_students for simplicity)
-allowed_students = np.full((num_classrooms, time_steps), max_students)
+    # Community interaction term
+    community_term = beta * c_i * u_i ** 2
 
-# Number of students attending both classrooms (k_ij matrix, random values for cross-classroom students)
-cross_classroom_students = np.random.randint(0, 20, size=(num_classrooms, num_classrooms))
+    # Cross-classroom interaction term
+    cross_class_term = 0
+    for j in range(len(allowed_students)):
+        if j != classroom_idx:
+            u_j = allowed_students[j]
+            i_j = infected[j]
+            cross_class_term += phi * i_j * u_j
 
-# Initialize infection dynamics for each classroom (initially 1 infected individual in each classroom)
-infected = np.zeros((num_classrooms, time_steps))
-infected[:, 0] = 1  # Start with 1 infected student per classroom
+    # Total infections at the next time step, capped by the classroom capacity
+    total_infections = min(in_class_term + community_term + cross_class_term, u_i)
 
+    return total_infections
 
-# Function to calculate R0 for each classroom
-def calculate_R0(classroom_idx, t):
+# Define the R0 calculation function
+def calculate_R0(classroom_idx, t, allowed_students, community_risk, alpha_m=2, beta=0.001, phi=0.005):
     u_i = allowed_students[classroom_idx, t]
     c_i = community_risk[classroom_idx, t]
 
-    # Within-classroom term
-    within_classroom = phi + beta * c_i * u_i
+    # In-class transmission
+    within_classroom = alpha_m * u_i
 
-    # Cross-classroom term
+    # Community transmission
+    community_term = beta * c_i * u_i ** 2
+
+    # Cross-classroom transmission
     cross_classroom = 0
-    for j in range(num_classrooms):
+    for j in range(allowed_students.shape[0]):
         if j != classroom_idx:
             u_j = allowed_students[j, t]
             c_j = community_risk[j, t]
-            k_ij = cross_classroom_students[classroom_idx, j]
-            cross_classroom += k_ij * (phi + beta * c_j * u_j)
+            cross_classroom += phi * u_j
 
-    # Calculate R0
-    R0 = within_classroom * (u_i - np.sum(cross_classroom_students[classroom_idx])) + cross_classroom
+    # Total R0
+    R0 = within_classroom + community_term + cross_classroom
     return R0
 
-
-def plot_threshold_behavior_R0():
-    allowed_values = np.arange(0, max_students + 10, 10)
-    R0_values = []
-
-    for allowed in allowed_values:
-        R0_sum = 0
-        for i in range(num_classrooms):
-            allowed_students[i, 0] = allowed
-            R0_sum += calculate_R0(i, 0)
-        R0_values.append(R0_sum / num_classrooms)
-
-    R0_values = np.array(R0_values)
-
-    plt.figure(figsize=(10, 6))
-    plt.plot(allowed_values, R0_values, label=r'$R_0$', color='black', linewidth=2)
-    plt.axhline(y=1, color='red', linestyle='--', label=r'$R_0 = 1$')
-    plt.fill_between(allowed_values, 0, R0_values, where=(R0_values < 1), color='blue', alpha=0.3, label='DFE region')
-    plt.fill_between(allowed_values, 0, R0_values, where=(R0_values >= 1), color='red', alpha=0.3, label='EE region')
-    plt.xlabel(r'Allowed Population $N_i$')
-    plt.ylabel(r'$R_0$')
-    plt.title(r'Threshold Behavior of $R_0$')
-    plt.legend()
-    plt.grid(True)
-    plt.tight_layout()
-    plt.savefig("R0_threshold_behavior.png")
-    plt.show()
-
-
-# Function to simulate infection dynamics and calculate R0 over time
-def simulate_infection_dynamics():
+# Define the simulation function
+def simulate_infection_dynamics(allowed_students, current_infected, community_risk, num_classrooms, time_steps, alpha_m, beta=0.001, phi=0.005):
     R0_values = np.zeros((num_classrooms, time_steps))
 
     for t in range(1, time_steps):
         for i in range(num_classrooms):
-            R0_i = calculate_R0(i, t)
+            # Calculate R0 for the current classroom at time t
+            R0_i = calculate_R0(i, t, allowed_students, community_risk, alpha_m, beta, phi)
             R0_values[i, t] = R0_i
 
-            u_i = allowed_students[i, t]
-            i_i = infected[i, t - 1]
-            c_i = community_risk[i, t]
+            # Use the infection model to calculate the number of infected for the next time step
+            expected_infections = infection_model(
+                allowed_students=allowed_students[:, t],
+                infected=current_infected[:, t - 1],
+                community_risk=community_risk[:, t],
+                classroom_idx=i,
+                alpha_m=alpha_m,
+                beta=beta,
+                phi=phi
+            )
 
-            alpha_i = phi * i_i / u_i + beta * c_i - i_i / u_i
-
-            cross_infection = 0
-            for j in range(num_classrooms):
-                if j != i:
-                    k_ij = cross_classroom_students[i, j]
-                    u_j = allowed_students[j, t]
-                    i_j = infected[j, t - 1]
-                    c_j = community_risk[j, t]
-                    alpha_j = phi * i_j / u_j + beta * c_j - i_j / u_j
-                    cross_infection += k_ij * (alpha_i + alpha_j)
-
-            delta_i = (u_i - np.sum(cross_classroom_students[i]) - i_i) * alpha_i + cross_infection
-            infected[i, t] = max(0, min(u_i, i_i + delta_i))
+            # Update the number of infected students, ensuring the number is capped by classroom capacity
+            current_infected[i, t] = max(0, min(allowed_students[i, t], expected_infections))
 
     return R0_values
 
-
-
-# Plot the threshold behavior showing regions of EE and DFE
-def plot_threshold_behavior(R0_values):
+# Define the plotting function
+def plot_threshold_behavior(R0_values, num_classrooms, time_steps):
     plt.figure(figsize=(10, 6))
+
+    # Use a colormap to assign distinct colors to each classroom
+    colors = plt.cm.viridis(np.linspace(0, 1, num_classrooms))
+
+    # Plot R0 for each classroom with different colors
     for i in range(num_classrooms):
-        plt.plot(R0_values[i], label=f"Classroom {i + 1}")
+        plt.plot(R0_values[i], label=f"Classroom {i + 1}", color=colors[i])
 
+    # Plot the threshold line at R0 = 1
     plt.axhline(y=1, color='r', linestyle='--', label='$R_0 = 1$ (Threshold)')
-    plt.fill_between(np.arange(time_steps), 0, 1, color='green', alpha=0.1, label="DFE Region (R_0 < 1)")
-    plt.fill_between(np.arange(time_steps), 1, np.max(R0_values), color='orange', alpha=0.1,
-                     label="EE Region (R_0 > 1)")
 
+    # Fill regions for DFE (R_0 < 1) and EE (R_0 > 1)
+    plt.fill_between(np.arange(time_steps), 0, 1, color='green', alpha=0.1, label="DFE Region (R_0 < 1)")
+    plt.fill_between(np.arange(time_steps), 1, np.max(R0_values), color='orange', alpha=0.1, label="EE Region (R_0 > 1)")
+
+    # Set plot labels and title
     plt.xlabel("Time Steps")
     plt.ylabel("$R_0$")
     plt.title("Threshold Behavior of the Model (R_0 over time)")
     plt.legend()
     plt.grid(True)
+    plt.tight_layout()
+
+    # Save the plot as a PNG file
     plt.savefig("threshold_behavior.png")
-    plt.show()
+    # plt.show()  # Uncomment this line to display the plot
 
+def plot_infection_dynamics(simulated_infected, num_classrooms, time_steps):
+    """
+    Plot the infection dynamics over time for each classroom based on the simulation.
 
-# Plot the infection dynamics
-def plot_infection_dynamics():
+    Parameters:
+    simulated_infected (array): Simulated number of infected students in each classroom over time.
+    num_classrooms (int): Number of classrooms.
+    time_steps (int): Number of time steps in the simulation.
+    """
     plt.figure(figsize=(10, 6))
+
+    # Use a colormap to assign distinct colors to each classroom
+    colors = plt.cm.plasma(np.linspace(0, 1, num_classrooms))
+
+    # Plot the infection dynamics for each classroom
     for i in range(num_classrooms):
-        plt.plot(infected[i], label=f"Classroom {i + 1}")
+        plt.plot(simulated_infected[i], label=f"Classroom {i + 1}", color=colors[i])
+
+    # Set plot labels and title
     plt.xlabel("Time Steps")
     plt.ylabel("Number of Infected Students")
-    plt.title("Infection Dynamics in Multiple Classrooms")
+    plt.title("Simulated Infection Dynamics in Classrooms Over Time")
     plt.legend()
     plt.grid(True)
+    plt.tight_layout()
+
+    # Save the plot as a PNG file
     plt.savefig("infection_dynamics.png")
-    plt.show()
+    # plt.show()  # Uncomment this line to display the plot
 
-
-def plot_sensitivity_phi_beta():
-    phi_values = np.linspace(0.0001, 0.01, 100)
-    beta_values = np.linspace(0.00001, 0.01, 100)
-
-    R0_values_phi = []
-    R0_values_beta = []
-
-    # Sensitivity to phi
-    for phi_val in phi_values:
-        global phi
-        phi = phi_val
-        R0 = calculate_R0(0, 0)
-        R0_values_phi.append(R0)
-
-    phi = 0.001  # Reset to original value
-
-    # Sensitivity to beta
-    for beta_val in beta_values:
-        global beta
-        beta = beta_val
-        R0 = calculate_R0(0, 0)
-        R0_values_beta.append(R0)
-
-    beta = 0.0001  # Reset to original value
-
-    plt.figure(figsize=(12, 6))
-
-    plt.subplot(1, 2, 1)
-    plt.plot(phi_values, R0_values_phi, label=r'$R_0$ vs $\phi$', color='blue')
-    plt.axhline(y=1, color='r', linestyle='--', label='$R_0 = 1$')
-    plt.xlabel(r'$\phi$ (Within-classroom transmission rate)')
-    plt.ylabel(r'$R_0$')
-    plt.title('Sensitivity of $R_0$ to $\\phi$')
-    plt.grid(True)
-    plt.legend()
-
-    plt.subplot(1, 2, 2)
-    plt.plot(beta_values, R0_values_beta, label=r'$R_0$ vs $\beta$', color='green')
-    plt.axhline(y=1, color='r', linestyle='--', label='$R_0 = 1$')
-    plt.xlabel(r'$\beta$ (Community transmission rate)')
-    plt.ylabel(r'$R_0$')
-    plt.title('Sensitivity of $R_0$ to $\\beta$')
-    plt.grid(True)
-    plt.legend()
-
-    plt.tight_layout()
-    plt.savefig("sensitivity_analysis.png")
-    plt.show()
-
-
-
-# Calculate and plot the stationary distribution of the transition matrix
-def plot_stationary_distribution(P, states):
-    eigenvalues, eigenvectors = linalg.eig(P.T)
-    stationary_index = np.argmin(np.abs(eigenvalues - 1))
-    stationary = eigenvectors[:, stationary_index].real
-    stationary /= stationary.sum()  # Normalize
-
-    x_values = []
-    y_values = []
-
-    for i, prob in enumerate(stationary):
-        x_values.append(states[i][0])  # community risk (example)
-        y_values.append(states[i][1])  # infected individuals
-
-    plt.figure(figsize=(10, 6))
-    plt.scatter(x_values, y_values, c=stationary, cmap='viridis', edgecolor='black')
-    plt.colorbar(label='Stationary Probability')
-    plt.xlabel('Community Risk')
-    plt.ylabel('Infected Individuals')
-    plt.title('Stationary Distribution')
-    plt.grid(True)
-    plt.tight_layout()
-    plt.savefig("stationary_distribution.png")
-    plt.show()
-
-# Plot the transition matrix
-def plot_transition_matrix(P):
-    plt.figure(figsize=(10, 6))
-    plt.imshow(P, cmap='gray', aspect='auto', origin='lower', vmin=0, vmax=1)
-    plt.colorbar(label='Transition Probability')
-    plt.xlabel('Next State Index')
-    plt.ylabel('Current State Index')
-    plt.title('Transition Probability Matrix')
-    plt.tight_layout()
-    plt.savefig("transition_matrix.png")
-    plt.show()
-# Plot Lyapunov function behavior
-def plot_lyapunov_function(P, states):
-    V = np.array([0.5 * (i ** 2 + a ** 2) for (a, i) in states])
-    expected_V_next = P @ V
-    delta_V = expected_V_next - V
-
-    dfe_indices = [i for i, (_, inf) in enumerate(states) if inf == 0]
-    ee_indices = [i for i, (_, inf) in enumerate(states) if inf > 0]
-
-    plt.figure(figsize=(10, 6))
-
-    plt.scatter(V[dfe_indices], delta_V[dfe_indices], color='blue', s=5, label='DFE region (Infected = 0)')
-    plt.scatter(V[ee_indices], delta_V[ee_indices], color='red', s=5, label='EE region (Infected > 0)')
-    plt.axhline(y=0, color='black', linestyle='--', label=r'$\Delta V = 0$')
-
-    plt.xlabel('Lyapunov Function Value $V$')
-    plt.ylabel(r'$\Delta V$')
-    plt.title('Lyapunov Function Behavior in DFE and EE Regions')
-    plt.legend()
-    plt.grid(True)
-    plt.tight_layout()
-    plt.savefig("lyapunov_function.png")
-    plt.show()
-
-# Simulate infection dynamics and calculate transition matrix P
-def simulate_transition_matrix():
-    states = [(100, i) for i in range(max_students + 1)]  # Possible states: (allowed, infected)
-    num_states = len(states)
-    P = np.zeros((num_states, num_states))  # Initialize the transition matrix
-
-    for t in range(time_steps):
-        community_risks = np.random.uniform(0, 1, num_states)  # Random community risk for each state
-
-        for idx, (a, i) in enumerate(states):
-            # Calculate new infections based on generalized R0
-            R0 = calculate_R0(0, t)  # Example for one classroom
-            delta_i = min(int(R0 * i), max_students)
-
-            # Find the next state based on the number of new infections
-            next_state = (a, delta_i)
-            next_idx = states.index(next_state)
-
-            # Update the transition matrix P
-            P[idx, next_idx] += 1
-
-    # Normalize the transition matrix
-    P = P / P.sum(axis=1, keepdims=True)
-    return P, states
-
-
-def plot_threshold_behavior_alpha_beta():
-    # Adjusted range of alpha (phi) and beta values
-    phi_values = np.linspace(0.001, 2, 100)
-    beta_values = np.linspace(0.001, 0.1, 100)
-
-    # Create a meshgrid for alpha and beta
-    phi_grid, beta_grid = np.meshgrid(phi_values, beta_values)
-
-    # Initialize R0_grid
-    R0_grid = np.zeros_like(phi_grid)
-
-    # Use mean community risk for simplification
-    c = np.mean(community_risk)
-
-    # Calculate R0 for each combination of phi and beta
-    for i in range(phi_grid.shape[0]):
-        for j in range(phi_grid.shape[1]):
-            phi = phi_grid[i, j]
-            beta = beta_grid[i, j]
-
-            # Within-classroom term
-            within_classroom = phi + beta * c * max_students
-
-            # Cross-classroom term (simplified for this plot)
-            cross_classroom = np.sum(cross_classroom_students) * (phi + beta * c * max_students)
-
-            # Calculate R0
-            R0_grid[i, j] = within_classroom * (max_students - np.sum(cross_classroom_students)) + cross_classroom
-
-    # Create a contour plot to visualize the relationship between phi, beta, and R0
-    plt.figure(figsize=(10, 8))
-
-    levels = np.linspace(0, np.max(R0_grid), 20)
-    im = plt.contourf(phi_grid, beta_grid, R0_grid, cmap='viridis', levels=levels)
-    plt.colorbar(im, label='$R_0$ Value')
-
-    # Add contour line for R0 = 1
-    R0_contour = plt.contour(phi_grid, beta_grid, R0_grid, levels=[1], colors='black', linestyles='--')
-    plt.clabel(R0_contour, inline=1, fontsize=10, fmt={1: '$R_0 = 1$'})
-
-    # Axis labels and plot settings
-    plt.xlabel(r'$\phi$ (Within-classroom transmission rate)')
-    plt.ylabel(r'$\beta$ (Community transmission rate)')
-    plt.title(r'Threshold Behavior of $R_0$ for Different $\phi$ and $\beta$')
-    plt.xlim(left=0)
-    plt.ylim(bottom=0)
-    plt.tight_layout()
-    plt.savefig("threshold_behavior_alpha_beta.png", dpi=300)
-    plt.show()
-
-
-def plot_phase_diagram_stochastic(phi, beta, max_students, community_risk, num_trajectories=5, num_steps=50):
+def plot_allowed_vs_R0_curve(num_classrooms, alpha_m=2.0, beta=0.001, phi=0.005, max_students=100):
     """
-    Plot a stochastic phase diagram showing infected vs allowed students with random community risk over time.
+    Plot Allowed vs R0 curve for each classroom, highlighting regions for DFE and EE with different shades.
 
-    Arguments:
-    phi -- within-classroom transmission rate
-    beta -- community transmission rate
-    max_students -- maximum number of students per classroom
-    community_risk -- community risk values (used to simulate randomness)
-    num_trajectories -- number of trajectories to simulate (default: 5)
-    num_steps -- number of steps for each trajectory (default: 50)
+    Parameters:
+    num_classrooms (int): Number of classrooms.
+    alpha_m (float): Transmission rate within the classroom.
+    beta (float): Transmission rate from the community.
+    phi (float): Cross-classroom transmission rate.
+    max_students (int): Maximum number of allowed students.
     """
+    # Calculate a mean community risk value from a fixed distribution
+    community_risk_mean = np.mean(np.random.uniform(0.5, 1.0, size=100))
 
-    # Initialize the phase space grid
-    u_range = np.linspace(0, max_students, 100)
-    i_range = np.linspace(0, max_students, 100)
-    u_grid, i_grid = np.meshgrid(u_range, i_range)
+    # Generate the range of allowed student values
+    allowed_values = np.linspace(0, max_students, 100)
+    R0_values = np.zeros((num_classrooms, len(allowed_values)))
 
-    def stochastic_step(u, i, phi, beta, c):
-        """
-        Perform one stochastic step based on current allowed students (u), infected students (i),
-        transmission rates (phi, beta), and community risk (c).
-        """
-        if u > 0:
-            # Introduce randomness in community risk for each step
-            c_random = np.random.uniform(0, 1) * c
-            alpha = max(0, phi * i / u + beta * c_random - i / u)
-            delta_i = (u - i) * alpha - i  # Infection increment with recovery term
-            i_new = i + delta_i
-            i_new = max(0, min(i_new, u))  # Ensure infected doesn't exceed allowed or fall below 0
-        else:
-            i_new = 0
+    for i in range(num_classrooms):
+        for j, allowed in enumerate(allowed_values):
+            # Ensure that infected does not exceed allowed
+            infected = min(allowed, np.random.uniform(1, allowed))  # Random infected, constrained by allowed
 
-        return u, i_new
+            # Recalculate R0 based on the varying allowed student values and the fixed community risk mean
+            within_classroom_R0 = alpha_m * infected  # Based on the number of infected
+            community_R0 = beta * community_risk_mean * allowed**2
+            cross_classroom_R0 = phi * infected  # Cross-classroom infections are still based on infected students
 
-    # Create the phase plot
-    plt.figure(figsize=(12, 10))
+            # Total R0 for the classroom
+            R0_values[i, j] = within_classroom_R0 + community_R0 + cross_classroom_R0
 
-    # Simulate and plot trajectories
-    colors = plt.cm.jet(np.linspace(0, 1, num_trajectories))
+    # Plotting the curves
+    plt.figure(figsize=(10, 6))
 
-    for idx, color in enumerate(colors):
-        u_0 = np.random.uniform(max_students / 2, max_students)  # Random initial allowed students
-        i_0 = np.random.uniform(0, u_0 / 2)  # Random initial infected students
-        u, i = u_0, i_0
+    # Use a colormap to assign distinct colors to each classroom
+    colors = plt.cm.cool(np.linspace(0, 1, num_classrooms))
+    dfe_colors = plt.cm.Greens(np.linspace(0.3, 0.7, num_classrooms))  # Lighter shades for DFE
+    ee_colors = plt.cm.Oranges(np.linspace(0.3, 0.7, num_classrooms))  # Lighter shades for EE
 
-        # Track the trajectory
-        trajectory_u = [u_0]
-        trajectory_i = [i_0]
+    # Plot R0 vs Allowed for each classroom
+    for i in range(num_classrooms):
+        plt.plot(allowed_values, R0_values[i], label=f"Classroom {i + 1}", color=colors[i])
 
-        for step in range(num_steps):
-            u, i = stochastic_step(u, i, phi, beta, np.mean(community_risk))
-            trajectory_u.append(u)
-            trajectory_i.append(i)
+        # Fill regions for DFE (R_0 < 1) and EE (R_0 >= 1) with different shades for each classroom
+        plt.fill_between(allowed_values, 0, R0_values[i], where=(R0_values[i] < 1), color=dfe_colors[i], alpha=0.3,
+                         label=f"DFE Region - Classroom {i + 1}")
+        plt.fill_between(allowed_values, 1, R0_values[i], where=(R0_values[i] >= 1), color=ee_colors[i], alpha=0.3,
+                         label=f"EE Region - Classroom {i + 1}")
 
-        # Plot the trajectory
-        plt.plot(trajectory_u, trajectory_i, '-', color=color, linewidth=2, label=f'Trajectory {idx + 1}')
-        plt.plot([u_0], [i_0], 'o', color=color, markersize=8)  # Mark starting point
+    # Plot the threshold line at R0 = 1
+    plt.axhline(y=1, color='red', linestyle='--', label='$R_0 = 1$ (Threshold)')
 
-    # Add labels and legend
-    plt.xlabel('Allowed Students')
-    plt.ylabel('Infected Students')
-    plt.title(
-        f'Stochastic Phase Diagram: Infected vs. Allowed Students\nφ={phi:.4f}, β={beta:.4f}, c={np.mean(community_risk):.2f}')
-    plt.xlim(0, max_students)
-    plt.ylim(0, max_students)
-    plt.grid(True, linestyle='--', alpha=0.7)
-
-    # Add diagonal line where infected = allowed
-    plt.plot([0, max_students], [0, max_students], 'gray', linestyle=':', label='Infected = Allowed')
-
-    plt.legend(loc='center left', bbox_to_anchor=(1, 0.5))
+    # Set plot labels and title
+    plt.xlabel("Allowed Students")
+    plt.ylabel("$R_0$")
+    plt.title(f"Allowed vs $R_0$ for Classrooms\n"
+              f"($\\alpha_m$={alpha_m}, $\\beta$={beta}, $\\phi$={phi}, CR mean={community_risk_mean:.2f})")
+    plt.legend()
+    plt.grid(True)
     plt.tight_layout()
-    plt.savefig("stochastic_phase_diagram.png")
-    plt.show()
+
+    # Save the plot as a PNG file
+    plt.savefig("allowed_vs_R0_curve_fixed.png")
+    # plt.show()  # Uncomment this line to display the plot
 
 
-max_students = 100
 
 
-plot_phase_diagram_stochastic(phi, beta, max_students, community_risk)
-P, states = simulate_transition_matrix()
+def calculate_R0_surface(alpha_m, beta, phi, allowed, community_risk_mean):
+    """
+    Calculate R0 based on transmission rates and return the R0 values.
+    """
+    within_classroom_R0 = alpha_m * allowed  # Based on allowed students
+    community_R0 = beta * community_risk_mean * allowed**2
+    cross_classroom_R0 = phi * allowed  # Cross-classroom infections
 
-# Run the simulation and plot the threshold behavior
+    # Total R0
+    R0 = within_classroom_R0 + community_R0 + cross_classroom_R0
+    return R0
 
-R0_values = simulate_infection_dynamics()
-plot_threshold_behavior_R0()
-plot_threshold_behavior(R0_values)
-plot_infection_dynamics()
-plot_sensitivity_phi_beta()
-plot_stationary_distribution(P, states)
-plot_transition_matrix(P)
-plot_lyapunov_function(P, states)
-plot_threshold_behavior_alpha_beta()
+def plot_R0_surface_3D(allowed=100, community_risk_mean=0.74):
+    """
+    Plot the 3D surface plot to show how R0 changes with alpha_m, beta, and phi.
+
+    Parameters:
+    allowed (int): Number of allowed students.
+    community_risk_mean (float): The mean community risk factor.
+    """
+    # Create ranges for alpha_m, beta, and phi
+    alpha_m_values = np.linspace(0.001, 0.5, 50)  # Range for alpha_m
+    beta_values = np.linspace(0.0001, 0.01, 50)  # Range for beta
+    phi_values = np.linspace(0.001, 0.5, 50)  # Range for phi
+
+    # Create a meshgrid for alpha_m and beta
+    alpha_m_grid, beta_grid = np.meshgrid(alpha_m_values, beta_values)
+
+    # Calculate R0 values for each combination of alpha_m, beta, and phi
+    R0_values = np.zeros((len(alpha_m_values), len(beta_values), len(phi_values)))
+
+    for i in range(len(alpha_m_values)):
+        for j in range(len(beta_values)):
+            for k, phi in enumerate(phi_values):
+                R0_values[i, j, k] = calculate_R0_surface(alpha_m_values[i], beta_values[j], phi, allowed, community_risk_mean)
+
+    # Select a slice for phi to represent it on the z-axis
+    phi_slice = phi_values  # z-axis will represent phi values
+
+    # Calculate the mean R0 values for the 2D surface (averaging over phi)
+    mean_R0_values = np.mean(R0_values, axis=2)
+
+    # Create a figure for the plot
+    fig = plt.figure(figsize=(12, 8))
+    ax = fig.add_subplot(111, projection='3d')
+
+    # Plot the 3D surface with phi on the z-axis
+    surf = ax.plot_surface(alpha_m_grid, beta_grid, phi_slice[:, None], facecolors=plt.cm.viridis(mean_R0_values / np.max(mean_R0_values)), edgecolor='none')
+    ax.set_xlim(0, max(alpha_m_values))  # Set x-axis (alpha_m) limit from 0
+    ax.set_ylim(0, max(beta_values))  # Set y-axis (beta) limit from 0
+    ax.set_zlim(0, max(phi_values))
+
+    # Add horizontal color bar for the R0 values
+    mappable = plt.cm.ScalarMappable(cmap='viridis')
+    mappable.set_array(mean_R0_values)
+    cbar = fig.colorbar(mappable, ax=ax, shrink=0.7, orientation='horizontal', pad=0.1, label='$R_0$')
+
+    # Set axis labels
+    ax.set_xlabel(r'$\alpha_m$ (Within-classroom transmission rate)')
+    ax.set_ylabel(r'$\beta$ (Community transmission rate)')
+    ax.set_zlabel(r'$\phi$ (Cross-classroom transmission rate)')
+    ax.set_title('Surface Plot of $R_0$ Based on Transmission Rates')
+
+    plt.tight_layout()
+    plt.savefig("R0_surface_plot_3D_updated.png")
+    # plt.show()  # Uncomment to display the plot
 
 
+# Main function to run the simulation
+def main():
+    # Simulation parameters
+    num_classrooms = 2  # Number of classrooms
+    time_steps = 52  # Number of time steps
+    max_students = 100  # Maximum number of students per classroom
+
+    # Transmission rates
+    alpha_m = 0.01  # Transmission rate within the classroom
+    beta = 0.001  # Transmission rate from the community
+    phi = 0.000001 # Cross-classroom transmission rate
+
+    # Community risk values for each classroom over time (randomized for simulation)
+    np.random.seed(42)  # For reproducibility
+    community_risk = np.random.uniform(0.1, 1.0, (num_classrooms, time_steps))
+
+    # Number of students allowed in each classroom (assumed to be max_students for simplicity)
+    allowed_students = np.full((num_classrooms, time_steps), max_students)
+
+    # Initialize infection dynamics for each classroom (initially 1 infected individual in each classroom)
+    current_infected = np.zeros((num_classrooms, time_steps))
+    current_infected[:, 0] = 1  # Start with 1 infected student per classroom
+
+    # Run the simulation
+    R0_values = simulate_infection_dynamics(
+        allowed_students=allowed_students,
+        current_infected=current_infected,
+        community_risk=community_risk,
+        num_classrooms=num_classrooms,
+        time_steps=time_steps,
+        alpha_m=alpha_m,
+        beta=beta,
+        phi=phi
+    )
+
+    # Plot the threshold behavior of R0 over time
+    plot_threshold_behavior(R0_values, num_classrooms, time_steps)
+
+    # Plot the infection dynamics using the simulated infected data
+    plot_infection_dynamics(current_infected, num_classrooms, time_steps)
+
+    # Plot Allowed vs R0 for both classrooms, showing DFE and EE regions
+    plot_allowed_vs_R0_curve(num_classrooms, alpha_m, beta, phi, max_students)
+
+    plot_R0_surface_3D(100, 0.4)
+
+
+if __name__ == "__main__":
+    main()
