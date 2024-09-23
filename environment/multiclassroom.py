@@ -9,7 +9,7 @@ import random
 
 class MultiClassroomEnv(ParallelEnv):
     def __init__(self, num_classrooms=1, total_students=100, max_weeks=2, action_levels_per_class=None,
-                 alpha=0.01, beta=0.001, phi=0.0000001, gamma=0.3, seed=None):
+                 alpha=0.01, beta=0.001, phi=0.0001, gamma=0.3, seed=None):
         self.num_classrooms = num_classrooms
         self.total_students = total_students
         self.max_weeks = max_weeks
@@ -45,6 +45,7 @@ class MultiClassroomEnv(ParallelEnv):
         self.student_status = [0] * num_classrooms  # Number of currently infected students per classroom
         self.allowed_students = [0] * num_classrooms
         self.community_risks = self._generate_episode_risks()
+        self.shared_community_risk = self._generate_shared_episode_risk()
 
 
         # Define the state space: all combinations of infected students (0 to 100) and community risk (0 to 1)
@@ -54,6 +55,33 @@ class MultiClassroomEnv(ParallelEnv):
 
     def seed(self, seed=None):
         np.random.seed(seed)
+
+    def _generate_shared_episode_risk(self):
+        """Generate a single community risk pattern for all classrooms over the weeks."""
+        self.episode_seed += 1
+        random.seed(self.episode_seed)
+        np.random.seed(self.episode_seed)
+
+        t = np.linspace(0, 2 * np.pi, self.max_weeks)
+        risk_pattern = np.zeros(self.max_weeks)
+
+        num_components = random.randint(1, 3)  # Use 1 to 3 sine components
+
+        # Generate the sine wave-based risk pattern
+        for _ in range(num_components):
+            amplitude = random.uniform(0.2, 0.4)
+            frequency = random.uniform(0.5, 2.0)
+            phase = random.uniform(0, 2 * np.pi)
+            risk_pattern += amplitude * np.sin(frequency * t + phase)
+
+        # Normalize and scale the risk pattern to range [0.0, 0.9]
+        risk_pattern = (risk_pattern - np.min(risk_pattern)) / (np.max(risk_pattern) - np.min(risk_pattern))
+        risk_pattern = 1.0 * risk_pattern + 0.0  # Scale to range [0.0, 0.9]
+
+        # Add some noise and clamp the values between 0.0 and 1.0
+        risk_pattern = [max(0.1, min(1.0, risk + random.uniform(-0.1, 0.1))) for risk in risk_pattern]
+
+        return risk_pattern
 
     def _generate_episode_risks(self):
         """Generate unique community risks for each classroom over the weeks."""
@@ -104,7 +132,7 @@ class MultiClassroomEnv(ParallelEnv):
             raise ValueError(f"State {state_tuple} not found in the state space.")
 
     def reset(self):
-        self.student_status = [np.random.randint(0, 5) for _ in range(self.num_classrooms)]  # Random initial infected per classroom
+        self.student_status = [np.random.randint(0, 50) for _ in range(self.num_classrooms)]  # Random initial infected per classroom
         self.allowed_students = [0] * self.num_classrooms
         self.current_week = 0
         return self._get_observations()
@@ -116,8 +144,7 @@ class MultiClassroomEnv(ParallelEnv):
 
         # Ensure that current_week does not exceed max_weeks
         current_week_index = min(self.current_week, self.max_weeks - 1)
-        lambda1 = 0.3 # Penalty for deviation in infected students
-        lambda2 = 0.5
+        community_risk = self.shared_community_risk[current_week_index]
 
         # Simulate infections using the updated model
         self.student_status = simulate_infections_n_classrooms(
@@ -127,7 +154,9 @@ class MultiClassroomEnv(ParallelEnv):
             self.phi,  # Cross-classroom transmission rate
             self.student_status,  # Current infected students per classroom
             self.allowed_students,  # Allowed students per classroom
-            self.community_risks[:, current_week_index]  # Community risk per classroom
+            [community_risk] * self.num_classrooms  # Shared community risk for all classrooms
+            # self.community_risks[:, current_week_index]  # Community risk per classroom
+
         )
 
         # Calculate rewards for each classroom
@@ -155,11 +184,20 @@ class MultiClassroomEnv(ParallelEnv):
         action_levels = self.action_levels_per_class[class_index]
         return action * (self.total_students // (action_levels - 1))
 
+    # def _get_observations(self):
+    #     # Return observations including only infected students and unique community risk for each classroom
+    #     return {
+    #         agent: np.array(
+    #             [self.student_status[i], self.community_risks[i][min(self.current_week, self.max_weeks - 1)]])
+    #         for i, agent in enumerate(self.agents)
+    #     }
+
     def _get_observations(self):
-        # Return observations including only infected students and unique community risk for each classroom
+        # Return observations including only infected students and shared community risk for each classroom
+        current_week_index = min(self.current_week, self.max_weeks - 1)
+        community_risk = self.shared_community_risk[current_week_index]
         return {
-            agent: np.array(
-                [self.student_status[i], self.community_risks[i][min(self.current_week, self.max_weeks - 1)]])
+            agent: np.array([self.student_status[i], community_risk])
             for i, agent in enumerate(self.agents)
         }
 

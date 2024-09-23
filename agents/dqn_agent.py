@@ -39,8 +39,8 @@ class DQNetwork(nn.Module):
         return self.network(state)
 
 class DQNAgent:
-    def __init__(self, agents, state_dim, action_space_size, learning_rate=0.001, discount_factor=0.99,
-                 epsilon=1.0, epsilon_decay=0.995, min_epsilon=0.01, batch_size=64, memory_size=10000):
+    def __init__(self, agents, state_dim, action_space_size, learning_rate=0.1, discount_factor=0.99,
+                 epsilon=1.0, epsilon_decay=0.99, min_epsilon=0.0001, batch_size=64, memory_size=10000):
         self.agents = agents
         self.state_dim = state_dim
         self.action_space_size = action_space_size
@@ -119,7 +119,7 @@ class DQNAgent:
             max_next_q_values = self.target_networks[agent](batch_next_state).max(1)[0]
 
             # Calculate the combined reward (global * batch reward)
-            combined_reward = global_reward + batch_reward
+            combined_reward = (global_reward * batch_reward)
 
             # Normalize the combined reward to [0, 1]
             min_combined = combined_reward.min().item()  # Get the minimum combined reward
@@ -128,6 +128,8 @@ class DQNAgent:
 
             # Compute target Q-values using the normalized combined reward
             target_q_values = normalized_combined_reward + (1 - batch_done) * max_next_q_values
+
+            # target_q_values = torch.where(batch_done == 1, combined_reward, target_q_values)
 
         # Compute the loss between current Q-values and target Q-values
         loss = nn.MSELoss()(current_q_values, target_q_values)
@@ -149,10 +151,10 @@ class DQNAgent:
     def linear_decay(self, episode, total_episodes):
         return max(self.min_epsilon, self.epsilon - (self.epsilon - self.min_epsilon) * (episode / total_episodes))
 
-    def exponential_decay(self, episode, decay_rate=0.01):
+    def exponential_decay(self, episode, decay_rate=0.8):
         return max(self.min_epsilon, self.epsilon * (1 - decay_rate) ** episode)
 
-    def inverse_time_decay(self, episode, decay_rate=0.01):
+    def inverse_time_decay(self, episode, decay_rate=0.8):
         return max(self.min_epsilon, self.epsilon / (1 + decay_rate * episode))
 
     def polynomial_decay(self, episode, total_episodes, power=2):
@@ -162,7 +164,7 @@ class DQNAgent:
         return self.min_epsilon + 0.5 * (self.epsilon - self.min_epsilon) * (
                     1 + np.cos(np.pi * episode / total_episodes))
 
-    def step_decay(self, episode, step_size=100, decay_factor=0.5):
+    def step_decay(self, episode, step_size=10, decay_factor=0.5):
         return max(self.min_epsilon, self.epsilon * (decay_factor ** (episode // step_size)))
 
     def sigmoid_decay(self, episode, total_episodes):
@@ -175,7 +177,7 @@ class DQNAgent:
     def hyperbolic_decay(self, episode, decay_rate=0.01):
         return max(self.min_epsilon, self.epsilon / (1 + decay_rate * episode ** 2))
 
-    def staircase_decay(self, episode, step_size=100, decay_factor=0.5):
+    def staircase_decay(self, episode, step_size=10, decay_factor=0.5):
         return max(self.min_epsilon, self.epsilon * (decay_factor ** (episode // step_size)))
 
     def adaptive_decay(self, episode, reward, threshold=0.1):
@@ -184,7 +186,7 @@ class DQNAgent:
         else:
             return self.epsilon
     def train(self, env, max_steps=30, update_target_steps=100):
-        total_episodes = 200
+        total_episodes = 500
         pbar = tqdm(total=total_episodes, desc="Training Progress", leave=True)
         for episode in range(total_episodes):
             states = env.reset()
@@ -213,6 +215,13 @@ class DQNAgent:
 
             self.epsilon = max(self.min_epsilon, self.epsilon * self.epsilon_decay)
             # self.epsilon = self.exponential_decay(episode)
+            # self.epsilon = self.cosine_decay(episode, total_episodes)
+            # self.epsilon = self.inverse_time_decay(episode)
+            # self.epsilon = self.sigmoid_decay(episode, total_episodes)
+            # self.epsilon = self.logarithmic_decay(episode)
+            # self.epsilon = self.hyperbolic_decay(episode)
+            # self.epsilon = self.staircase_decay(episode)
+
             # if episode % update_target_steps == 0:
             for agent in self.agents:
                 self.update_target_network(agent)
@@ -242,6 +251,58 @@ class DQNAgent:
         plt.ylabel("Total Reward")
         plt.legend()
         plt.grid(True)
+        if not os.path.exists(os.path.dirname(save_path)):
+            os.makedirs(os.path.dirname(save_path))
+        plt.savefig(save_path)
+
+    def evaluate(self, env, max_steps=52):
+        states = env.reset()
+        episode_infected = {agent: [] for agent in self.agents}
+        episode_allowed = {agent: [] for agent in self.agents}
+        episode_community_risk = {agent: [] for agent in self.agents}
+
+        for step in range(max_steps):
+            actions = {agent: self.select_action(agent, states[agent]) for agent in self.agents}
+            next_states, rewards, dones, _ = env.step(actions)
+
+            for agent in self.agents:
+                episode_infected[agent].append(env.student_status[self.agents.index(agent)])
+                episode_allowed[agent].append(env.allowed_students[self.agents.index(agent)])
+                episode_community_risk[agent].append(
+                    env.shared_community_risk[min(env.current_week, env.max_weeks - 1)])
+            states = next_states
+            if all(dones.values()):
+                break
+
+        self.plot_infected_allowed_and_risk_over_time(episode_infected, episode_allowed, episode_community_risk,
+                                                      save_path="results/infected_allowed_and_risk_over_time_evaluation.png")
+
+    def plot_infected_allowed_and_risk_over_time(self, infected_over_time, allowed_over_time, community_risk_over_time,
+                                                 save_path="results/infected_allowed_and_risk_over_time.png"):
+        num_agents = len(infected_over_time)
+        fig, axes = plt.subplots(num_agents, 1, figsize=(10, 5 * num_agents), sharex=True)
+
+        if num_agents == 1:
+            axes = [axes]
+
+        for i, agent in enumerate(infected_over_time):
+            ax = axes[i]
+            ax.bar(range(len(allowed_over_time[agent])), allowed_over_time[agent], alpha=0.6,
+                   label=f"{agent} Allowed Over Time")
+            ax.plot(infected_over_time[agent], color='r', label=f"{agent} Infected Over Time")
+            ax.set_title(f"{agent} - Number of Infected, Allowed Students, and Community Risk Over Time")
+            ax.set_xlabel("Step")
+            ax.set_ylabel("Number of Students")
+            ax.legend(loc='upper left')
+            ax.grid(True)
+
+            ax2 = ax.twinx()
+            ax2.plot(community_risk_over_time[agent], color='g', linestyle='--',
+                     label=f"{agent} Community Risk Over Time")
+            ax2.set_ylabel("Community Risk")
+            ax2.legend(loc='upper right')
+
+        plt.tight_layout()
         if not os.path.exists(os.path.dirname(save_path)):
             os.makedirs(os.path.dirname(save_path))
         plt.savefig(save_path)

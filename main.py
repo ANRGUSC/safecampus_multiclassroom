@@ -52,18 +52,9 @@ def dqn_run(gamma=0.2):
     agent.train(env, max_steps=100)
 
     for agent_name in agents:
-        infected_test_values = np.linspace(0, 100, num=10).astype(int)
-        community_risk_test_values = np.linspace(0.0, 1.0, num=10)
-
-        # print(f"\nActions for {agent_name}:")
-        # for infected in infected_test_values:
-        #     for community_risk in community_risk_test_values:
-        #         state = np.array([infected, community_risk])
-        #         action = agent.select_action(agent_name, state)
-        #         print(f"State (Infected: {infected}, Community Risk: {community_risk:.2f}) -> Action: {action}")
-
         save_path = f"./results/{agent_name}_all_states_dqn_{env.gamma}.png"
         visualize_all_states_dqn(agent_name, env, agent, save_path=save_path)
+        agent.evaluate(env, max_steps=30)
 
 def doubledqn_run(gamma=0.2):
     num_classrooms = 2
@@ -94,13 +85,16 @@ def a2c_run(gamma=0.2):
     agent = CentralizedA2CAgent(agents, state_dim, global_state_dim, action_space_size)
 
     # Train the centralized A2C agent
-    agent.train(env, max_steps=30)
+    agent.train(env, max_steps=52)
 
     # Test the learned policies
     for agent_name in agents:
         # Save visualizations of the learned policies
         save_path = f"./results/{agent_name}_all_states_a2c_centralized_{env.gamma}.png"
+
         visualize_all_states_dqn(agent_name, env, agent, save_path=save_path)
+    eval_path = f"./results/eval_a2c_centralized_{env.gamma}.png"
+    agent.evaluate(env, max_steps=52, save_path=eval_path)
 def ppo_run(gamma=0.2):
     num_classrooms = 2  # Number of classrooms (agents)
     env = MultiClassroomEnv(num_classrooms=num_classrooms, total_students=100, max_weeks=52,
@@ -123,21 +117,21 @@ def ppo_run(gamma=0.2):
         visualize_all_states_ppo(agent_name, env, agent, save_path=save_path)
 def main():
     # Define the gamma values to test
-    gamma_values = [0.4]
+    gamma_values = [0.2]
 
     # Loop over each gamma value and run the training for each agent type
     for gamma in gamma_values:
         # print(f"\nRunning Q-learning with gamma = {gamma}")
         # q_learning_run(gamma)
 
-        print(f"\nRunning DQN with gamma = {gamma}")
-        dqn_run(gamma)
+        # print(f"\nRunning DQN with gamma = {gamma}")
+        # dqn_run(gamma)
 
         # print(f"\nRunning DQN with gamma = {gamma}")
         # doubledqn_run(gamma)
         #
-        # print(f"\nRunning A2C with gamma = {gamma}")
-        # a2c_run(gamma)
+        print(f"\nRunning A2C with gamma = {gamma}")
+        a2c_run(gamma)
         # print(f"\nRunning PPO with gamma = {gamma}")
         # ppo_run(gamma)
 
