@@ -1,139 +1,202 @@
 from environment.multiclassroom import MultiClassroomEnv
 from agents.dqn_agent import DQNAgent
-from agents.doubledqn_agent import DoubleDQNAgent
-from agents.q_learning import IndependentQLearningAgent
-from agents.ppo_agent import PPOAgent
-from agents.a2c_agent import CentralizedA2CAgent
-from utils.visualization import visualize_all_states, visualize_all_states_dqn, visualize_all_states_ppo
+from utils.visualization import visualize_all_states_dqn
 import numpy as np
-import itertools
+import os
+import pandas as pd
+import time
+from datetime import datetime
+import random
+import torch
+
 SEED = 42
-np.random.seed(SEED)
 
+def run_dqn_experiment(
+    total_students,
+    num_classrooms,
+    action_levels,
+    gamma_values,
+    alphas,
+    num_seeds=10,
+    max_steps=73,
+    out_dir="./results"
+):
+    """
+    For each (gamma, alpha):
+      1) Train once.
+      2) Visualize policy.
+      3) Evaluate across num_seeds.
+      4) Emit three CSVs with averaged metrics.
+    """
+    np.random.seed(SEED)
+    random.seed(SEED)
+    torch.manual_seed(SEED)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(SEED)
 
-def q_learning_run(gamma=0.2):
-    num_classrooms = 2  # Example with 3 classrooms
-    env = MultiClassroomEnv(num_classrooms=num_classrooms, total_students=100, max_weeks=52,
-                            action_levels_per_class=[3, 3, 3], seed=42, gamma=gamma)
+    timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+    os.makedirs(out_dir, exist_ok=True)
 
-    agents = [f'classroom_{i}' for i in range(num_classrooms)]
-    infected_values = range(0, 101, 10)
-    community_risk_values = [i / 10 for i in range(11)]
-    state_space = list(itertools.product(infected_values, community_risk_values))
-    action_space_size = env.action_spaces[agents[0]].n
+    global_rows = []
+    ia_rows     = []
+    time_rows   = []
 
-    agent = IndependentQLearningAgent(agents, state_space, action_space_size)
-    agent.train(env, max_steps=52)
-
-    for agent_name in agents:
-        infected_test_values = np.linspace(0, 100, num=10).astype(int)
-        community_risk_test_values = np.linspace(0.0, 1.0, num=10)
-
-        # print(f"\nActions for {agent_name}:")
-        # for infected in infected_test_values:
-        #     for community_risk in community_risk_test_values:
-        #         state = (infected, community_risk)
-        #         action = agent.select_action(agent_name, state)
-        #         print(f"State (Infected: {infected}, Community Risk: {community_risk:.2f}) -> Action: {action}")
-
-        save_path = f"./results/{agent_name}_q_learning_all_states_{env.gamma}.png"
-        visualize_all_states(agent_name, env, agent.q1_tables, agent.q2_tables, save_path=save_path)
-
-def dqn_run(gamma=0.2):
-    num_classrooms = 2
-    env = MultiClassroomEnv(num_classrooms=num_classrooms, total_students=100, max_weeks=52,
-                            action_levels_per_class=[5, 5], seed=42, gamma=gamma)
-
-    agents = [f'classroom_{i}' for i in range(num_classrooms)]
-    state_dim = env.observation_spaces[agents[0]].shape[0]
-    action_space_size = env.action_spaces[agents[0]].n
-
-    agent = DQNAgent(agents, state_dim, action_space_size)
-    agent.train(env, max_steps=100)
-
-    for agent_name in agents:
-        save_path = f"./results/{agent_name}_all_states_dqn_{env.gamma}.png"
-        visualize_all_states_dqn(agent_name, env, agent, save_path=save_path)
-        agent.evaluate(env, max_steps=30)
-
-def doubledqn_run(gamma=0.2):
-    num_classrooms = 2
-    env = MultiClassroomEnv(num_classrooms=num_classrooms, total_students=100, max_weeks=52,
-                            action_levels_per_class=[5, 5], seed=42, gamma=gamma)
-
-    agents = [f'classroom_{i}' for i in range(num_classrooms)]
-    state_dim = env.observation_spaces[agents[0]].shape[0]
-    action_space_size = env.action_spaces[agents[0]].n
-
-    agent = DoubleDQNAgent(agents, state_dim, action_space_size)
-    agent.train(env, max_steps=100)
-
-    for agent_name in agents:
-        save_path = f"./results/{agent_name}_all_states_dqn_{env.gamma}.png"
-        visualize_all_states_dqn(agent_name, env, agent, save_path=save_path)
-def a2c_run(gamma=0.2):
-    num_classrooms = 2  # Number of classrooms (agents)
-    env = MultiClassroomEnv(num_classrooms=num_classrooms, total_students=100, max_weeks=52,
-                            action_levels_per_class=[3, 3], seed=42, gamma=gamma)
-
-    agents = [f'classroom_{i}' for i in range(num_classrooms)]
-    state_dim = 2  # Local state dimension (infected, community risk) for each agent
-    global_state_dim = num_classrooms * state_dim  # Global state for centralized critic (combines all agents' states)
-    action_space_size = env.action_spaces[agents[0]].n
-
-    # Initialize the centralized A2C agent with decentralized actors and centralized critic
-    agent = CentralizedA2CAgent(agents, state_dim, global_state_dim, action_space_size)
-
-    # Train the centralized A2C agent
-    agent.train(env, max_steps=52)
-
-    # Test the learned policies
-    for agent_name in agents:
-        # Save visualizations of the learned policies
-        save_path = f"./results/{agent_name}_all_states_a2c_centralized_{env.gamma}.png"
-
-        visualize_all_states_dqn(agent_name, env, agent, save_path=save_path)
-    eval_path = f"./results/eval_a2c_centralized_{env.gamma}.png"
-    agent.evaluate(env, max_steps=52, save_path=eval_path)
-def ppo_run(gamma=0.2):
-    num_classrooms = 2  # Number of classrooms (agents)
-    env = MultiClassroomEnv(num_classrooms=num_classrooms, total_students=100, max_weeks=52,
-                            action_levels_per_class=[3, 3], seed=42, gamma=gamma)
-
-    agents = [f'classroom_{i}' for i in range(num_classrooms)]
-    state_dim = 2  # Local state dimension (infected, community risk) for each agent
-    action_space_size = env.action_spaces[agents[0]].n
-
-    # Initialize the PPO agent
-    agent = PPOAgent(agents, state_dim, action_space_size)
-
-    # Train the PPO agent
-    agent.train(env, max_steps=30)
-
-    # Test the learned policies
-    for agent_name in agents:
-        # Save visualizations of the learned policies
-        save_path = f"./results/{agent_name}_all_states_ppo_{env.gamma}.png"
-        visualize_all_states_ppo(agent_name, env, agent, save_path=save_path)
-def main():
-    # Define the gamma values to test
-    gamma_values = [0.2]
-
-    # Loop over each gamma value and run the training for each agent type
+    agents = [f"classroom_{i}" for i in range(num_classrooms)]
     for gamma in gamma_values:
-        # print(f"\nRunning Q-learning with gamma = {gamma}")
-        # q_learning_run(gamma)
+        for alpha in alphas:
+            # 1) Single training run
+            env = MultiClassroomEnv(
+                num_classrooms=num_classrooms,
+                total_students=total_students,
+                max_weeks=max_steps,
+                action_levels_per_class=[action_levels]*num_classrooms,
+                seed=SEED,
+                gamma=gamma,
+                community_risk_data_file=None
+            )
+            state_dim = env.observation_spaces[agents[0]].shape[0]
+            act_n     = env.action_spaces[agents[0]].n
+            agent = DQNAgent(agents, state_dim, act_n,
+                             reward_mix_alpha=alpha, gamma=gamma, seed=SEED)
 
-        # print(f"\nRunning DQN with gamma = {gamma}")
-        # dqn_run(gamma)
+            t0 = time.time()
+            agent.train(env, max_steps=max_steps)
+            train_time = time.time() - t0
+            time_rows.append({
+                "gamma": gamma,
+                "alpha": alpha,
+                "mean_training_time": train_time,
+                "timestamp": timestamp
+            })
 
-        # print(f"\nRunning DQN with gamma = {gamma}")
-        # doubledqn_run(gamma)
-        #
-        print(f"\nRunning A2C with gamma = {gamma}")
-        a2c_run(gamma)
-        # print(f"\nRunning PPO with gamma = {gamma}")
-        # ppo_run(gamma)
+            # 2) Visualize learned policy
+            vis_path = os.path.join(out_dir, f"dqn_policy_γ{gamma}_α{alpha}_{timestamp}.png")
+            visualize_all_states_dqn(
+                agents,
+                env,
+                agent,
+                save_path=vis_path,
+                grid_size=100
+            )
 
-if __name__ == "__main__":
-    main()
+            # 3) Multi-seed evaluation
+            rewards_accum   = []
+            infected_accum  = []
+            allowed_accum   = []
+
+            for _ in range(num_seeds):
+                seed = random.randint(0, 2**31-1)
+                env_eval = MultiClassroomEnv(
+                    num_classrooms=num_classrooms,
+                    total_students=total_students,
+                    max_weeks=max_steps,
+                    action_levels_per_class=[action_levels]*num_classrooms,
+                    seed=seed,
+                    gamma=gamma,
+                    community_risk_data_file=None
+                )
+                env_eval.set_mode(True)
+                data = agent.evaluate(env_eval, max_steps=max_steps)
+
+                # system-wide global reward
+                rewards = list(data["total_rewards"].values())
+                rewards_accum.append(np.mean(rewards))
+
+                # avg infected & allowed per run
+                infs = [np.mean(data["agents"][ag]["infected"]) for ag in agents]
+                alls = [np.mean(data["agents"][ag]["allowed_students"]) for ag in agents]
+                infected_accum.append(np.mean(infs))
+                allowed_accum.append(np.mean(alls))
+
+            # 4) Aggregate and record
+            global_rows.append({
+                "gamma": gamma,
+                "alpha": alpha,
+                "global_mean_reward": float(np.mean(rewards_accum)),
+                "timestamp": timestamp
+            })
+            ia_rows.append({
+                "gamma": gamma,
+                "alpha": alpha,
+                "mean_infected": float(np.mean(infected_accum)),
+                "mean_allowed": float(np.mean(allowed_accum)),
+                "timestamp": timestamp
+            })
+
+    # 5) Save summaries
+    pd.DataFrame(global_rows).to_csv(os.path.join(out_dir, "dqn_global_summary.csv"), index=False)
+    pd.DataFrame(ia_rows).    to_csv(os.path.join(out_dir, "dqn_inf_allowed_summary.csv"), index=False)
+    pd.DataFrame(time_rows).  to_csv(os.path.join(out_dir, "dqn_time_summary.csv"), index=False)
+
+    print(f"Saved summaries and visuals in {out_dir}/")
+
+def make_env(seed, gamma, total_students, num_classrooms, max_steps, action_levels):
+    env = MultiClassroomEnv(
+        num_classrooms=num_classrooms,
+        total_students=total_students,
+        max_weeks=max_steps,
+        action_levels_per_class=[action_levels]*num_classrooms,
+        seed=seed,
+        gamma=gamma,
+        community_risk_data_file=None
+    )
+    return env
+
+def objective(trial):
+    # 1) sample hyperparameters
+    lr  = trial.suggest_loguniform("learning_rate", 1e-4, 1e-1)
+    hd  = trial.suggest_categorical("hidden_dim",   [16, 32, 64])
+    hl  = trial.suggest_int("hidden_layers", 2, 4)
+
+    # fixed experiment settings
+    total_students     = 100
+    num_classrooms     = 2
+    state_dim          = 2
+    action_space_size  = 3
+    action_levels      = 3
+    gamma_values       = [0.1, 0.2, 0.3]
+    eval_seeds         = [0,1,2]   # fewer seeds for speed
+    max_steps          = 52
+    train_seed         = 0
+
+    # aggregate reward across all gamma
+    total_reward = 0.0
+    for gamma in gamma_values:
+        # train one agent
+        agents = [f"classroom_{i}" for i in range(num_classrooms)]
+        agent = DQNAgent(
+            agents=agents,
+            state_dim=state_dim,
+            action_space_size=action_space_size,
+            learning_rate=lr,
+            hidden_dim=hd,
+            hidden_layers=hl,
+            gamma=gamma,
+            seed=train_seed
+        )
+        env_train = make_env(train_seed, gamma, total_students, num_classrooms, max_steps, action_levels)
+        agent.train(env_train, max_steps=max_steps)
+
+        # evaluate over seeds
+        for seed in eval_seeds:
+            np.random.seed(seed)
+            random.seed(seed)
+            env_eval = make_env(seed, gamma, total_students, num_classrooms, max_steps, action_levels)
+            data = agent.evaluate(env_eval, max_steps=max_steps)
+            total_reward += sum(data["total_rewards"].values())
+
+    # return the negative if we want to minimize; here we maximize
+    return total_reward
+
+if __name__=="__main__":
+    study = optuna.create_study(direction="maximize")
+    study.optimize(objective, n_trials=50)
+
+    # get the best parameters
+    best_params = study.best_trial.params
+    print("Best hyperparameters:", best_params)
+
+    # save to CSV
+    df = pd.DataFrame([best_params])
+    df.to_csv("best_dqn_hyperparameters.csv", index=False)
+    print("Saved best hyperparams to best_dqn_hyperparameters.csv")

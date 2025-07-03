@@ -1,9 +1,11 @@
-import torch
+import os
 import matplotlib.pyplot as plt
 import numpy as np
 import matplotlib.patches as mpatches
-import os
+import math
+from matplotlib.colors import ListedColormap, BoundaryNorm
 import colorsys
+import torch
 
 
 def generate_distinct_colors(n):
@@ -12,288 +14,710 @@ def generate_distinct_colors(n):
     RGB_tuples = list(map(lambda x: colorsys.hsv_to_rgb(*x), HSV_tuples))
     return ['#{:02x}{:02x}{:02x}'.format(int(r * 255), int(g * 255), int(b * 255)) for r, g, b in RGB_tuples]
 
-def visualize_all_states_ppo(agent, env, a2c_agent, save_path="results/policy_visualization.png"):
+def visualize_tabular(
+    agents,
+    env,
+    tabular_agent,
+    save_path="results/tabular_policy.png",
+    gamma=0.1,
+    grid_size=100
+):
     """
-    Visualize the learned policy for all states by displaying the best action for each state using distinct colors.
-    Args:
-        agent: The agent whose A2C model we are visualizing.
-        env: The environment object for access to the agent.
-        a2c_agent: The trained A2C agent.
-        save_path: Where to save the generated visualization.
+    Mirror visualize_all_states_dqn but calling tabular_agent.select_action.
     """
-    # Generate distinct colors for the number of actions
-    action_colors = generate_distinct_colors(env.action_spaces[agent].n)
+    n_agents = len(agents)
 
-    # Prepare to visualize
-    fig, ax = plt.subplots(figsize=(6, 6))
+    # 1) build colormap
+    num_actions = env.action_spaces[agents[0]].n
+    action_colors = generate_distinct_colors(num_actions)
+    cmap = ListedColormap(action_colors)
+    norm = BoundaryNorm(np.arange(num_actions+1)-0.5, num_actions)
 
-    # Lists to store the visualization data
-    x_vals, y_vals, state_colors, actions = [], [], [], []
+    # 2) layout
+    if n_agents <= 3:
+        nrows, ncols = 1, n_agents
+    elif n_agents == 4:
+        nrows, ncols = 2, 2
+    else:
+        side = int(math.sqrt(n_agents))
+        nrows = ncols = side
 
-    # Iterate through the state space
-    for state_tuple in env.state_space:
-        infected, community_risk = state_tuple
-        state = np.array([infected, community_risk])
+    # 3) state ranges
+    max_inf = max(i for i,_ in env.state_space)
+    min_risk, max_risk = (
+        min(r for _, r in env.state_space),
+        max(r for _, r in env.state_space)
+    )
+    baseline = np.array([50,0.5])
 
-        # Find the best action from the A2C model for this state
-        best_action = a2c_agent.select_action(agent, state)  # Ensure this returns an integer
+    # 4) lattice
+    N = grid_size
+    risk_vals     = np.linspace(min_risk, max_risk, N)
+    infected_vals = np.linspace(0, max_inf, N).astype(int)
 
-        # Store values for plotting
-        x_vals.append(community_risk)  # Community risk as x-axis
-        y_vals.append(infected)  # Infected as y-axis
-        state_colors.append(action_colors[best_action])  # Assign color based on the best action
-        actions.append(best_action)  # Track action for color reference
+    fig, axes = plt.subplots(nrows, ncols, figsize=(5*ncols,5*nrows), squeeze=False)
+    axs = axes.flatten()
 
-    # Plot the states with the corresponding actions using distinct colors
-    scatter = ax.scatter(x_vals, y_vals, c=state_colors, s=100, marker='s')
+    # 6) per-agent policy map
+    for idx, ag in enumerate(agents):
+        ax = axs[idx]
+        policy = np.empty((N,N), int)
+        for yi, inf in enumerate(infected_vals):
+            for xi, risk in enumerate(risk_vals):
+                # build state for this agent
+                policy[yi, xi] = tabular_agent.select_action(idx, (inf, risk))
+        ax.imshow(policy, origin='lower', cmap=cmap, norm=norm,
+                  interpolation='nearest', aspect='equal')
+        ticks = [0, N//2, N-1]
+        ax.set_xticks(ticks)
+        ax.set_xticklabels([f"{min_risk:.2f}", f"{(min_risk+max_risk)/2:.2f}", f"{max_risk:.2f}"])
+        ax.set_yticks(ticks)
+        ax.set_yticklabels(["0", f"{max_inf/2:.0f}", f"{max_inf:.0f}"])
+        ax.set_title(ag)
+        ax.set_xlabel("Community Risk")
+        ax.set_ylabel("Infected Students")
 
-    # Create a legend for the actions
-    legend_elements = [mpatches.Patch(facecolor=color, label=f'Action {i}') for i, color in enumerate(action_colors)]
-    ax.legend(handles=legend_elements, loc='upper right')
+    for ax in axs[n_agents:]:
+        ax.axis('off')
 
-    # Set plot labels and title
-    ax.set_xlabel("Community Risk (%)")
-    ax.set_ylabel("Infected Students")
-    ax.set_title(f"Learned Policy (Best Action) for All States - {agent}")
+    # legend
+    allowed_vals = env.action_levels[0]  # same for all
+    patches = [mpatches.Patch(color=action_colors[a], label=f"{allowed_vals[a]} students")
+               for a in range(num_actions)]
+    fig.subplots_adjust(bottom=0.15, hspace=0.4)
+    fig.legend(handles=patches, loc='lower center', ncol=num_actions,
+               title="Color → action", bbox_to_anchor=(0.5,0.05), frameon=False)
 
-    # Save the plot
-    if not os.path.exists(os.path.dirname(save_path)):
-        os.makedirs(os.path.dirname(save_path))
+    fig.suptitle(f"Tabular Policy Map (γ={gamma:.2f})", fontsize=16)
+    plt.tight_layout(rect=[0,0.15,1,0.95])
+
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
     plt.savefig(save_path)
-    # plt.show()
-
-    print(f"Policy visualization saved at {save_path}")
-    return save_path
-
-def visualize_all_states_a2c(agent, env, a2c_agent, save_path="results/policy_visualization.png"):
-    """
-    Visualize the learned policy for all states by displaying the best action for each state using distinct colors.
-    Args:
-        agent: The agent whose A2C model we are visualizing.
-        env: The environment object for access to the agent.
-        a2c_agent: The trained A2C agent.
-        save_path: Where to save the generated visualization.
-    """
-    # Generate distinct colors for the number of actions
-    action_colors = generate_distinct_colors(env.action_spaces[agent].n)
-
-    # Prepare to visualize
-    fig, ax = plt.subplots(figsize=(6, 6))
-
-    # Lists to store the visualization data
-    x_vals, y_vals, state_colors, actions = [], [], [], []
-
-    # Iterate through the state space
-    for state_tuple in env.state_space:
-        infected, community_risk = state_tuple
-        state = np.array([infected, community_risk])
-
-        # Find the best action from the A2C model for this state
-        best_action = a2c_agent.select_action(agent, state)  # Ensure this returns an integer
-
-        # Store values for plotting
-        x_vals.append(community_risk)  # Community risk as x-axis
-        y_vals.append(infected)  # Infected as y-axis
-        state_colors.append(action_colors[best_action])  # Assign color based on the best action
-        actions.append(best_action)  # Track action for color reference
-
-    # Plot the states with the corresponding actions using distinct colors
-    scatter = ax.scatter(x_vals, y_vals, c=state_colors, s=100, marker='s')
-
-    # Create a legend for the actions
-    legend_elements = [mpatches.Patch(facecolor=color, label=f'Action {i}') for i, color in enumerate(action_colors)]
-    ax.legend(handles=legend_elements, loc='upper right')
-
-    # Set plot labels and title
-    ax.set_xlabel("Community Risk (%)")
-    ax.set_ylabel("Infected Students")
-    ax.set_title(f"Learned Policy (Best Action) for All States - {agent}")
-
-    # Save the plot
-    if not os.path.exists(os.path.dirname(save_path)):
-        os.makedirs(os.path.dirname(save_path))
-    plt.savefig(save_path)
-    # plt.show()
-
-    print(f"Policy visualization saved at {save_path}")
-    return save_path
-def visualize_all_states_dqn(agent, env, dqn_agent, save_path="results/policy_visualization.png"):
-    """
-    Visualize the learned policy for all states by displaying the best action for each state using distinct colors.
-    Args:
-        agent: The agent whose DQN model we are visualizing.
-        env: The environment object for access to the agent.
-        dqn_agent: The trained DQN agent.
-        save_path: Where to save the generated visualization.
-    """
-    # Generate distinct colors for the number of actions
-    action_colors = generate_distinct_colors(env.action_spaces[agent].n)
-
-    # Prepare to visualize
-    fig, ax = plt.subplots(figsize=(6, 6))
-
-    # Lists to store the visualization data
-    x_vals, y_vals, state_colors, actions = [], [], [], []
-
-    # Iterate through the state space
-    for state_tuple in env.state_space:
-        # State is continuous, so no need for get_state_index, pass directly to the DQN
-        infected, community_risk = state_tuple
-        state = np.array([infected, community_risk])
-
-        # Find the best action from the DQN model for this state
-        best_action = dqn_agent.select_action(agent, state)
-
-        # Store values for plotting
-        x_vals.append(community_risk)  # Community risk as x-axis
-        y_vals.append(infected)  # Infected as y-axis
-        state_colors.append(action_colors[best_action])  # Assign color based on the best action
-        actions.append(best_action)  # Track action for color reference
-
-    # Plot the states with the corresponding actions using distinct colors
-    scatter = ax.scatter(x_vals, y_vals, c=state_colors, s=100, marker='s')
-
-    # Create a legend for the actions
-    legend_elements = [mpatches.Patch(facecolor=color, label=f'Action {i}') for i, color in enumerate(action_colors)]
-    ax.legend(handles=legend_elements, loc='upper right')
-
-    # Set plot labels and title
-    ax.set_xlabel("Community Risk (%)")
-    ax.set_ylabel("Infected Students")
-    ax.set_title(f"Learned Policy (Best Action) for All States - {agent}")
-
-    # Save the plot
-    if not os.path.exists(os.path.dirname(save_path)):
-        os.makedirs(os.path.dirname(save_path))
-    plt.savefig(save_path)
-    # plt.show()
-
-
-
-
-    print(f"Policy visualization saved at {save_path}")
+    plt.close(fig)
+    print(f"Saved tabular policy visualization to {save_path}")
     return save_path
 
 
-def visualize_all_states(agent, env, q1_tables, q2_tables, save_path="results/policy_visualization.png"):
+def visualize_all_states_dqn(
+    agents,
+    env,
+    dqn_agent,
+    save_path="results/policy_visualization.png",
+    gamma=0.1,
+    grid_size=100
+
+):
     """
-    Visualize the learned policy for all states by displaying the best action for each state using distinct colors.
-    Args:
-        agent: The agent whose Q1 and Q2 tables we are visualizing.
-        env: The environment object for access to the agent.
-        q1_tables: The Q1-table for the agent, with rows as state indices and columns as action indices.
-        q2_tables: The Q2-table for the agent, with rows as state indices and columns as action indices.
-        save_path: Where to save the generated visualization.
+    Flexible grid layout:
+      • 1–3 agents → 1×n row
+      •  4 agents  → 2×2
+      • >4 agents  → √n×√n (assumes n is a perfect square)
+    Each panel shows a grid_size×grid_size policy map via imshow with square cells.
     """
-    # Generate distinct colors for the number of actions
-    action_colors = generate_distinct_colors(env.action_spaces[agent].n)
+    n_agents = len(agents)
 
-    # Prepare to visualize
-    fig, ax = plt.subplots(figsize=(6, 6))
+    # 1) Build colormap
+    num_actions = env.action_spaces[agents[0]].n
+    action_colors = generate_distinct_colors(num_actions)
+    cmap = ListedColormap(action_colors)
+    norm = BoundaryNorm(np.arange(num_actions+1)-0.5, ncolors=num_actions)
 
-    # Lists to store the visualization data
-    x_vals, y_vals, state_colors, actions = [], [], [], []
+    # 2) Determine subplot layout
+    if n_agents <= 3:
+        nrows, ncols = 1, n_agents
+    elif n_agents == 4:
+        nrows, ncols = 2, 2
+    else:
+        side = int(math.sqrt(n_agents))
+        if side * side != n_agents:
+            raise ValueError(f"n_agents={n_agents} >4 must be a perfect square")
+        nrows = ncols = side
 
-    # Iterate through the state space
-    for state_tuple in env.state_space:
-        state_idx = env.get_state_index(state_tuple)  # Get the index of the current state
+    # 3) Data ranges & baseline
+    max_inf = max(i for i, _ in env.state_space)
+    min_risk, max_risk = min(r for _, r in env.state_space), max(r for _, r in env.state_space)
+    baseline_state = np.array([50, 0.5])
 
-        # Find the best action by summing the Q-values from both Q1 and Q2 tables
-        q_sum = q1_tables[agent][state_idx] + q2_tables[agent][state_idx]
-        best_action = np.argmax(q_sum)
+    # 4) Build fixed lattice
+    N = grid_size
+    risk_vals     = np.linspace(min_risk, max_risk, N)
+    infected_vals = np.linspace(0, max_inf,     N).astype(int)
 
-        infected, community_risk = state_tuple
+    # 5) Create figure and axes
+    fig, axes = plt.subplots(nrows, ncols, figsize=(5*ncols, 5*nrows), squeeze=False)
+    axes_flat = axes.flatten()
 
-        # Store values for plotting
-        x_vals.append(community_risk)  # Community risk as x-axis
-        y_vals.append(infected)  # Infected as y-axis
-        state_colors.append(action_colors[best_action])  # Assign color based on the best action
-        actions.append(best_action)  # Track action for color reference
+    # 6) Plot each agent
+    for idx, agent_name in enumerate(agents):
+        ax = axes_flat[idx]
+        # compute policy array
+        policy = np.empty((N, N), dtype=int)
+        for yi, inf in enumerate(infected_vals):
+            for xi, risk in enumerate(risk_vals):
+                joint = []
+                for ag in agents:
+                    if ag == agent_name:
+                        joint.extend([int(inf), float(risk)])
+                    else:
+                        joint.extend(baseline_state)
+                policy[yi, xi] = dqn_agent.select_action(
+                    agent_name, np.array([int(inf), float(risk)])
+                )
+        # render with square cells
+        ax.imshow(
+            policy,
+            origin='lower',
+            cmap=cmap,
+            norm=norm,
+            interpolation='nearest',
+            aspect='equal'
+        )
+        # relabel ticks back to data units
+        ticks = [0, N//2, N-1]
+        ax.set_xticks(ticks)
+        ax.set_xticklabels([
+            f"{min_risk:.2f}",
+            f"{(min_risk+max_risk)/2:.2f}",
+            f"{max_risk:.2f}"
+        ])
+        ax.set_yticks(ticks)
+        ax.set_yticklabels([
+            "0",
+            f"{max_inf/2:.0f}",
+            f"{max_inf:.0f}"
+        ])
+        ax.set_title(agent_name)
+        ax.set_xlabel("Community Risk")
+        ax.set_ylabel("Infected Students")
 
-    # Plot the states with the corresponding actions using distinct colors
-    scatter = ax.scatter(x_vals, y_vals, c=state_colors, s=100, marker='s')
+    # 7) Turn off any unused subplots
+    for ax in axes_flat[n_agents:]:
+        ax.axis('off')
 
-    # Create a legend for the actions
-    legend_elements = [mpatches.Patch(facecolor=color, label=f'Action {i}') for i, color in enumerate(action_colors)]
-    ax.legend(handles=legend_elements, loc='upper right')
+    # 8) Shared legend below all
+    total_students = env.total_students
+    allowed_vals = np.linspace(0, total_students, num_actions).astype(int)
+    action_patches = [
+        mpatches.Patch(color=action_colors[a], label=f"{allowed_vals[a]} students")
+        for a in range(num_actions)
+    ]
 
-    # Set plot labels and title
-    ax.set_xlabel("Community Risk (%)")
-    ax.set_ylabel("Infected Students")
-    ax.set_title(f"Learned Policy (Best Action) for All States - {agent}")
+    # leave room for legend
+    fig.subplots_adjust(bottom=0.15, hspace=0.4)
+    fig.legend(
+        handles=action_patches,
+        loc='lower center',
+        ncol=num_actions,
+        title="Color → action",
+        bbox_to_anchor=(0.5, 0.05),
+        frameon=False
+    )
 
-    # Save the plot
-    if not os.path.exists(os.path.dirname(save_path)):
-        os.makedirs(os.path.dirname(save_path))
+    # 9) Title & layout
+    # title per gamma value
+    fig.suptitle(f"MC-CTDE Policy Map (γ={gamma:.2f})", fontsize=16)
+    plt.tight_layout(rect=[0, 0.15, 1, 0.95])
+
+    # 10) Save and close
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
     plt.savefig(save_path)
+    plt.close(fig)
+    print(f"Saved policy visualization to {save_path}")
 
-    print(f"Policy visualization saved at {save_path}")
     return save_path
 
-
-def visualize_myopic_states(myopic_agent, env, alpha=0.4):
+def visualize_all_states_centralized(
+    agents,
+    env,
+    agent,                  # your DQNAgent with a CentralizedDQNetwork
+    save_path="results/centralized_policy.png",
+    gamma: float = 0.0,     # ← new parameter
+    grid_size=100,
+    baseline_state=None
+):
     """
-    Visualize the state-action mappings for all agents and classrooms in the environment using Myopic Policy.
-
-    Args:
-        myopic_agent: The MyopicPolicy instance used for action selection.
-        env: The environment to visualize.
-        alpha: The alpha value for reward calculation in Myopic Policy.
+    Visualize each agent’s marginal policy under the fully‐centralized critic,
+    labeling the figure with the discount γ.
     """
-    method_name = "viz_all_states_myopic"
-    results_subdirectory = "./myopic_results"
-    file_paths = []
 
-    # Ensure the results directory exists
-    if not os.path.exists(results_subdirectory):
-        os.makedirs(results_subdirectory)
+    n_agents = len(agents)
+    num_actions = env.action_spaces[agents[0]].n
 
-    # Generate distinct colors for the number of actions in each classroom
-    action_colors = generate_distinct_colors(env.action_spaces[env.agents[0]].n)
+    # Colormap & norm
+    action_colors = generate_distinct_colors(num_actions)
+    cmap = ListedColormap(action_colors)
+    norm = BoundaryNorm(np.arange(num_actions+1)-0.5, ncolors=num_actions)
 
-    for agent in env.agents:
-        fig, ax = plt.subplots()
+    # Subplot layout
+    if n_agents <= 3:
+        nrows, ncols = 1, n_agents
+    elif n_agents == 4:
+        nrows, ncols = 2, 2
+    else:
+        side = int(math.sqrt(n_agents))
+        nrows = ncols = side
 
-        state_colors = []
-        x_vals = []
-        y_vals = []
-        actions = []
+    # State‐space grid
+    max_inf = max(i for i,_ in env.state_space)
+    min_risk, max_risk = min(r for _,r in env.state_space), max(r for _,r in env.state_space)
+    inf_vals = np.linspace(0, max_inf, grid_size).astype(int)
+    risk_vals = np.linspace(min_risk, max_risk, grid_size)
 
-        # Iterate over possible states (infected, community risk)
-        for infected in range(0, env.total_students + 1, 10):  # Increment by 10 for clarity in visualization
-            for community_risk in range(0, 101, 10):  # Community risk from 0% to 100%
-                # Prepare state with matching input dimensions (infected, community_risk)
-                infected_tensor = torch.FloatTensor([infected])
-                community_risk_tensor = torch.FloatTensor([community_risk / 100])
+    # Baseline for non‐plotted agents
+    if baseline_state is None:
+        baseline_state = (int(max_inf/2), float((min_risk+max_risk)/2))
 
-                # Use the MyopicPolicy to get the action
-                label, allowed_value, _, _ = myopic_agent.get_label(
-                    infected_tensor, community_risk_tensor, agent, alpha
+    # Figure
+    fig, axes = plt.subplots(nrows, ncols, figsize=(5*ncols, 5*nrows), squeeze=False)
+    axes_flat = axes.flatten()
+
+    for idx, ag in enumerate(agents):
+        ax = axes_flat[idx]
+        policy = np.zeros((grid_size, grid_size), dtype=int)
+
+        for yi, inf in enumerate(inf_vals):
+            for xi, risk in enumerate(risk_vals):
+                joint = []
+                for other in agents:
+                    if other == ag:
+                        joint.extend([inf, risk])
+                    else:
+                        joint.extend(baseline_state)
+
+                with torch.no_grad():
+                    q_heads = agent.network(
+                        torch.FloatTensor(joint).unsqueeze(0)
+                    ).squeeze(0)   # (N, A)
+
+                joint_act = [int(q_heads[i].argmax()) for i in range(n_agents)]
+                policy[yi, xi] = joint_act[idx]
+
+        im = ax.imshow(policy, origin='lower', cmap=cmap, norm=norm, aspect='equal')
+        ticks = [0, grid_size//2, grid_size-1]
+        ax.set_xticks(ticks)
+        ax.set_xticklabels([f"{min_risk:.2f}", f"{(min_risk+max_risk)/2:.2f}", f"{max_risk:.2f}"])
+        ax.set_yticks(ticks)
+        ax.set_yticklabels(["0", f"{max_inf/2:.0f}", f"{max_inf:.0f}"])
+        ax.set_title(ag)
+        ax.set_xlabel("Community Risk")
+        ax.set_ylabel("Infected Students")
+
+    # Turn off unused
+    for ax in axes_flat[n_agents:]:
+        ax.axis('off')
+
+    # Legend
+    allowed_vals = np.array(env.action_levels[0])
+    patches = [
+        mpatches.Patch(color=action_colors[i], label=f"{allowed_vals[i]} students")
+        for i in range(num_actions)
+    ]
+    fig.subplots_adjust(bottom=0.15, hspace=0.4)
+    fig.legend(handles=patches, loc='lower center', ncol=num_actions,
+               title="Color → action", frameon=False)
+
+    # Title with gamma
+    fig.suptitle(f"Centralized Q‐Policy Marginals (γ = {gamma:.2f})", fontsize=16)
+
+    plt.tight_layout(rect=[0,0.15,1,0.95])
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    plt.savefig(save_path)
+    plt.close(fig)
+    print(f"Saved centralized policy visualization to {save_path}")
+
+
+def visualize_all_states_ppo(
+    agents,
+    env,
+    ppo_agent,
+    save_path="results/ppo_policy_continuous.png",
+    gamma=0.1,
+    grid_size=100
+):
+    """
+    Layout same as before, but each cell now shows the continuous
+    action (allowed students) via a smooth colormap.
+    """
+    n_agents = len(agents)
+
+    # 1) Determine subplot layout
+    if n_agents <= 3:
+        nrows, ncols = 1, n_agents
+    elif n_agents == 4:
+        nrows, ncols = 2, 2
+    else:
+        side = int(math.sqrt(n_agents))
+        if side * side != n_agents:
+            raise ValueError("n_agents>4 must be a perfect square")
+        nrows = ncols = side
+
+    # 2) State-space ranges
+    max_inf = max(i for i, _ in env.state_space)
+    min_risk, max_risk = min(r for _, r in env.state_space), max(r for _, r in env.state_space)
+    baseline = np.array([50, 0.5])
+
+    # 3) Grid over (inf, risk)
+    N = grid_size
+    risk_vals     = np.linspace(min_risk, max_risk, N)
+    infected_vals = np.linspace(0, max_inf,     N)
+
+    # 4) Figure
+    fig, axes = plt.subplots(nrows, ncols, figsize=(5*ncols, 5*nrows), squeeze=False)
+    axes_flat = axes.flatten()
+
+    for idx, agent_name in enumerate(agents):
+        ax = axes_flat[idx]
+        policy = np.zeros((N, N), dtype=float)
+
+        for yi, inf in enumerate(infected_vals):
+            for xi, risk in enumerate(risk_vals):
+                # build joint-state
+                joint = []
+                for ag in agents:
+                    if ag == agent_name:
+                        joint.extend([inf, risk])
+                    else:
+                        joint.extend(baseline)
+                js = torch.FloatTensor(joint).unsqueeze(0)  # (1, N*S)
+
+                # evaluate the Gaussian policy mean
+                means, log_stds, _ = ppo_agent.net(js)
+                mean_val = means[0, idx].item()      # continuous action for this agent
+                # optionally scale mean_val to student count:
+                # if your network outputs in [0,1], then:
+                # mean_val = mean_val * env.total_students
+
+                policy[yi, xi] = mean_val
+
+        # plot as heatmap
+        im = ax.imshow(
+            policy,
+            origin='lower',
+            cmap='viridis',
+            vmin=0,
+            vmax=env.total_students,   # scale colorbar to actual student counts
+            interpolation='nearest',
+            aspect='equal'
+        )
+        # axis labels
+        ticks = [0, N//2, N-1]
+        ax.set_xticks(ticks)
+        ax.set_xticklabels([f"{min_risk:.2f}", f"{(min_risk+max_risk)/2:.2f}", f"{max_risk:.2f}"])
+        ax.set_yticks(ticks)
+        ax.set_yticklabels([f"{0:.0f}", f"{max_inf/2:.0f}", f"{max_inf:.0f}"])
+        ax.set_title(agent_name)
+        ax.set_xlabel("Community Risk")
+        ax.set_ylabel("Infected Students")
+
+        # colorbar for this subplot
+        cb = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+        cb.set_label("Allowed Students")
+
+    # turn off empty subplots
+    for ax in axes_flat[n_agents:]:
+        ax.axis('off')
+
+    fig.suptitle(f"PPO Continuous Policy Map (γ={gamma:.2f})", fontsize=16)
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    plt.savefig(save_path)
+    plt.close(fig)
+    print(f"Saved continuous‐action policy visualization to {save_path}")
+
+# def visualize_all_states_ppo(
+#     agents,
+#     env,
+#     ppo_agent,
+#     save_path="results/ppo_policy.png",
+#     gamma=0.1,
+#     grid_size=100
+# ):
+#     """
+#     Same layout and style as DQN version, but uses PPOAgent's policy (argmax over actor logits).
+#     """
+#     n_agents = len(agents)
+#
+#     # 1) Colormap
+#     num_actions = env.action_spaces[agents[0]].n
+#     action_colors = generate_distinct_colors(num_actions)
+#     cmap = ListedColormap(action_colors)
+#     norm = BoundaryNorm(np.arange(num_actions+1)-0.5, ncolors=num_actions)
+#
+#     # 2) Layout
+#     if n_agents <= 3:
+#         nrows, ncols = 1, n_agents
+#     elif n_agents == 4:
+#         nrows, ncols = 2, 2
+#     else:
+#         side = int(math.sqrt(n_agents))
+#         if side * side != n_agents:
+#             raise ValueError("n_agents>4 must be perfect square")
+#         nrows = ncols = side
+#
+#     # 3) State-space ranges
+#     max_inf = max(i for i, _ in env.state_space)
+#     min_risk, max_risk = min(r for _, r in env.state_space), max(r for _, r in env.state_space)
+#     baseline = np.array([50, 0.5])
+#
+#     # 4) Grid
+#     N = grid_size
+#     risk_vals     = np.linspace(min_risk, max_risk, N)
+#     infected_vals = np.linspace(0, max_inf,     N).astype(int)
+#
+#     # 5) Figure
+#     fig, axes = plt.subplots(nrows, ncols, figsize=(5*ncols, 5*nrows), squeeze=False)
+#     axes_flat = axes.flatten()
+#
+#     for idx, agent_name in enumerate(agents):
+#         ax = axes_flat[idx]
+#         policy = np.zeros((N, N), dtype=int)
+#
+#         for yi, inf in enumerate(infected_vals):
+#             for xi, risk in enumerate(risk_vals):
+#                 # build joint-state with this agent at (inf, risk)
+#                 joint = []
+#                 for ag in agents:
+#                     if ag == agent_name:
+#                         joint.extend([int(inf), float(risk)])
+#                     else:
+#                         joint.extend(baseline)
+#                 js = torch.FloatTensor(joint).unsqueeze(0)
+#                 logits, _ = ppo_agent.net(js)
+#                 # argmax action for this agent
+#                 policy[yi, xi] = logits[0, agents.index(agent_name)].argmax().item()
+#
+#         ax.imshow(policy, origin='lower', cmap=cmap, norm=norm,
+#                   interpolation='nearest', aspect='equal')
+#         ticks = [0, N//2, N-1]
+#         ax.set_xticks(ticks)
+#         ax.set_xticklabels([f"{min_risk:.2f}", f"{(min_risk+max_risk)/2:.2f}", f"{max_risk:.2f}"])
+#         ax.set_yticks(ticks)
+#         ax.set_yticklabels(["0", f"{max_inf/2:.0f}", f"{max_inf:.0f}"])
+#         ax.set_title(agent_name)
+#         ax.set_xlabel("Community Risk")
+#         ax.set_ylabel("Infected Students")
+#
+#     # turn off extras
+#     for ax in axes_flat[n_agents:]:
+#         ax.axis('off')
+#
+#     # legend
+#     total = env.total_students
+#     allowed = np.linspace(0, total, num_actions).astype(int)
+#     patches = [mpatches.Patch(color=action_colors[a], label=f"{allowed[a]} students")
+#                for a in range(num_actions)]
+#
+#     fig.subplots_adjust(bottom=0.15, hspace=0.4)
+#     fig.legend(handles=patches, loc='lower center', ncol=num_actions,
+#                title="Action → # students", bbox_to_anchor=(0.5,0.05), frameon=False)
+#
+#     fig.suptitle(f"PPO Policy Map (γ={gamma:.2f})", fontsize=16)
+#     plt.tight_layout(rect=[0,0.15,1,0.95])
+#
+#     os.makedirs(os.path.dirname(save_path), exist_ok=True)
+#     plt.savefig(save_path)
+#     plt.close(fig)
+#     print(f"Saved policy visualization to {save_path}")
+
+
+
+def visualize_myopic_policy(
+    agents,
+    env,
+    myopic_agent,
+    save_path="results/myopic_policy.png",
+    gamma=0.1,
+    grid_size=100,
+    dpi=None,
+    bbox_inches=None
+):
+    """
+    Flexible grid layout:
+      • 1–3 agents → 1×n row
+      •  4 agents  → 2×2
+      • >4 agents  → √n×√n (assumes n is a perfect square)
+    Each panel shows a grid_size×grid_size policy map via imshow with square cells.
+    """
+    n_agents = len(agents)
+
+    # 1) Build colormap/norm
+    num_actions = len(myopic_agent.allowed_values)
+    action_colors = generate_distinct_colors(num_actions)
+    cmap = ListedColormap(action_colors)
+    norm = BoundaryNorm(np.arange(num_actions+1)-0.5, ncolors=num_actions)
+
+    # 2) Determine subplot layout
+    if n_agents <= 3:
+        nrows, ncols = 1, n_agents
+    elif n_agents == 4:
+        nrows, ncols = 2, 2
+    else:
+        side = int(math.sqrt(n_agents))
+        if side * side != n_agents:
+            raise ValueError(f"n_agents={n_agents} >4 must be a perfect square")
+        nrows = ncols = side
+
+    # 3) Data ranges
+    if hasattr(env, 'state_space'):
+        inf_vals, risk_vals = zip(*env.state_space)
+        min_risk, max_risk = min(risk_vals), max(risk_vals)
+        max_inf = max(inf_vals)
+    else:
+        min_risk, max_risk = 0.0, 1.0
+        max_inf = env.total_students
+
+    # 4) Build lattice
+    N = grid_size
+    risk_grid     = np.linspace(min_risk, max_risk, N)
+    infected_grid = np.linspace(0, max_inf,     N).astype(int)
+
+    # 5) Create figure
+    fig, axes = plt.subplots(nrows, ncols, figsize=(5*ncols, 5*nrows), squeeze=False)
+
+    axes_flat = axes.flatten()
+
+    # 6) Plot each agent
+    for idx, agent_name in enumerate(agents):
+        ax = axes_flat[idx]
+        policy = np.empty((N, N), dtype=int)
+
+        # fill policy map
+        for yi, inf in enumerate(infected_grid):
+            for xi, risk in enumerate(risk_grid):
+                policy[yi, xi] = myopic_agent.select_best_action(
+                    agent_name,
+                    (int(inf), float(risk)),
+                    env.gamma
                 )
 
-                action = label
+        ax.imshow(
+            policy,
+            origin='lower',
+            cmap=cmap,
+            norm=norm,
+            interpolation='nearest',
+            aspect='equal'
+        )
+        ticks = [0, N//2, N-1]
+        ax.set_xticks(ticks)
+        ax.set_xticklabels([
+            f"{min_risk:.2f}",
+            f"{(min_risk+max_risk)/2:.2f}",
+            f"{max_risk:.2f}"
+        ])
+        ax.set_yticks(ticks)
+        ax.set_yticklabels([
+            "0",
+            f"{max_inf/2:.0f}",
+            f"{max_inf:.0f}"
+        ])
 
-                # Store values for plotting
-                state_colors.append(action_colors[action])
-                actions.append(action)
-                x_vals.append(community_risk)
-                y_vals.append(infected)
+        ax.set_title(agent_name)
+        ax.set_xlabel("Community Risk")
+        ax.set_ylabel("Infected Students")
 
-        # Plot the states with the corresponding actions
-        scatter = ax.scatter(x_vals, y_vals, c=state_colors, s=100, marker='s')
+    # 7) Turn off unused axes
+    for ax in axes_flat[n_agents:]:
+        ax.axis('off')
 
-        # Add legend
-        legend_elements = [mpatches.Patch(facecolor=color, label=f'Action {i}') for i, color in
-                           enumerate(action_colors)]
-        ax.legend(handles=legend_elements, loc='upper right')
-        ax.set_xlabel('Community Risk (%)')
-        ax.set_ylabel('Infected Students')
-        ax.set_title(f'State Visualization for {agent} using Myopic Policy')
+    # 8) Shared legend below
+    action_patches = [
+        mpatches.Patch(color=action_colors[a], label=f"{myopic_agent.allowed_values[a]:.0f} students")
+        for a in range(num_actions)
+    ]
+    fig.subplots_adjust(bottom=0.15, hspace=0.4)
+    fig.legend(
+        handles=action_patches,
+        loc='lower center',
+        ncol=num_actions,
+        title="Allowed → action",
+        bbox_to_anchor=(0.5, 0.05),
+        frameon=False
+    )
 
-        # Save the plot
-        file_name = f"{method_name}_{agent}_states.png"
-        plt.savefig(os.path.join(results_subdirectory, file_name))
-        file_paths.append(os.path.join(results_subdirectory, file_name))
-        plt.close(fig)
+    # 9) Title & layout
+    fig.suptitle(f"Myopic Policy Maps (γ={gamma:.2f})", fontsize=16)
+    plt.tight_layout(rect=[0, 0.15, 1, 0.95])
 
-    return file_paths
+    # 10) Save and close
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    fig.savefig(save_path, dpi=dpi, bbox_inches=bbox_inches)
+    plt.close(fig)
+
+    print(f"Myopic policy visualization saved to {save_path}")
+    return save_path
+
+# def visualize_myopic_policy(agent, env, myopic_agent, save_path="results/myopic_policy.png"):
+#     """
+#     Visualize the myopic agent policy over a discrete set of states using a scatter plot,
+#     with one subplot per classroom laid out side by side.
+#
+#     If env has a predefined discrete state space (env.state_space), it is used.
+#     Otherwise, we generate a grid over:
+#       - Infected students: from 0 to env.total_students (50 discrete values)
+#       - Community risk: from 0 to 1.0 (50 discrete values)
+#
+#     Each state is colored according to the best action chosen by the agent.
+#     """
+#     # Generate distinct colors for each action.
+#     action_space_size = len(myopic_agent.allowed_values)
+#     action_colors = generate_distinct_colors(action_space_size)
+#
+#     # Determine the discrete state space
+#     if hasattr(env, 'state_space'):
+#         state_space = env.state_space
+#     else:
+#         num_infected = 50
+#         num_risk = 50
+#         infected_vals = np.linspace(0, env.total_students, num_infected)
+#         risk_vals = np.linspace(0, 1.0, num_risk)
+#         state_space = [(inf, risk) for inf in infected_vals for risk in risk_vals]
+#
+#     num_agents = len(env.agents)
+#     fig, axes = plt.subplots(1, num_agents, figsize=(6 * num_agents, 6), squeeze=False)
+#
+#     for idx, ag in enumerate(env.agents):
+#         ax = axes[0, idx]
+#         x_vals, y_vals, state_colors = [], [], []
+#
+#         # For each possible state, compute the best action for this classroom
+#         for infected, community_risk in state_space:
+#             best_action = myopic_agent.select_best_action(ag, (infected, community_risk), env.gamma)
+#             x_vals.append(community_risk)
+#             y_vals.append(infected)
+#             state_colors.append(action_colors[best_action])
+#
+#         # Scatter plot for this classroom
+#         ax.scatter(x_vals, y_vals, c=state_colors, s=100, marker='s')
+#         ax.set_xlabel("Community Risk")
+#         ax.set_ylabel("Infected Students")
+#         ax.set_title(f"{ag}\nα={myopic_agent.reward_mix_alpha:.2f}, γ={env.gamma:.2f}")
+#         ax.grid(True, alpha=0.3)
+#
+#         # Add legend once under the first subplot
+#         if idx == 0:
+#             legend_elements = [
+#                 mpatches.Patch(
+#                     facecolor=color,
+#                     label=f'Action {i} ({myopic_agent.allowed_values[i].item():.0f} students)'
+#                 )
+#                 for i, color in enumerate(action_colors)
+#             ]
+#             ax.legend(
+#                 handles=legend_elements,
+#                 loc='upper center',
+#                 bbox_to_anchor=(0.5, -0.15),
+#                 ncol=action_space_size
+#             )
+#
+#     # Save the combined figure
+#     os.makedirs(os.path.dirname(save_path), exist_ok=True)
+#     plt.tight_layout()
+#     plt.savefig(save_path, dpi=300, bbox_inches='tight')
+#     plt.close()
+#
+#     print(f"Myopic policy visualization saved at {save_path}")
+#     return save_path
+#
+#

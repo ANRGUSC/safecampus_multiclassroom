@@ -1,326 +1,602 @@
 import numpy as np
 import matplotlib.pyplot as plt
-from scipy import linalg
+from scipy.optimize import fsolve
+import itertools
+import random
 from mpl_toolkits.mplot3d import Axes3D
-SEED = 42
-np.random.seed(SEED)
+from matplotlib import cm
 
-# Define the infection model function
-def infection_model(allowed_students, infected, community_risk, classroom_idx, alpha_m=2, beta=0.001, phi=0.005):
-    u_i = allowed_students[classroom_idx]  # Allowed students in the classroom
-    i_i = infected[classroom_idx]  # Current infected students in the classroom
-    c_i = community_risk[classroom_idx]  # Community risk for the classroom
 
-    # Within-classroom term
-    in_class_term = alpha_m * i_i * u_i
-
-    # Community interaction term
-    community_term = beta * c_i * u_i ** 2
-
-    # Cross-classroom interaction term
-    cross_class_term = 0
-    for j in range(len(allowed_students)):
-        if j != classroom_idx:
-            u_j = allowed_students[j]
-            i_j = infected[j]
-            cross_class_term += phi * i_j * u_j
-
-    # Total infections at the next time step, capped by the classroom capacity
-    total_infections = min(in_class_term + community_term + cross_class_term, u_i)
-
-    return total_infections
-
-# Define the R0 calculation function
-def calculate_R0(classroom_idx, t, allowed_students, community_risk, alpha_m=2, beta=0.001, phi=0.005):
-    u_i = allowed_students[classroom_idx, t]
-    c_i = community_risk[classroom_idx, t]
-
-    # In-class transmission
-    within_classroom = alpha_m * u_i
-
-    # Community transmission
-    community_term = beta * c_i * u_i ** 2
-
-    # Cross-classroom transmission
-    cross_classroom = 0
-    for j in range(allowed_students.shape[0]):
-        if j != classroom_idx:
-            u_j = allowed_students[j, t]
-            c_j = community_risk[j, t]
-            cross_classroom += phi * u_j
-
-    # Total R0
-    R0 = within_classroom + community_term + cross_classroom
-    return R0
-
-# Define the simulation function
-def simulate_infection_dynamics(allowed_students, current_infected, community_risk, num_classrooms, time_steps, alpha_m, beta=0.001, phi=0.005):
-    R0_values = np.zeros((num_classrooms, time_steps))
-
-    for t in range(1, time_steps):
-        for i in range(num_classrooms):
-            # Calculate R0 for the current classroom at time t
-            R0_i = calculate_R0(i, t, allowed_students, community_risk, alpha_m, beta, phi)
-            R0_values[i, t] = R0_i
-
-            # Use the infection model to calculate the number of infected for the next time step
-            expected_infections = infection_model(
-                allowed_students=allowed_students[:, t],
-                infected=current_infected[:, t - 1],
-                community_risk=community_risk[:, t],
-                classroom_idx=i,
-                alpha_m=alpha_m,
-                beta=beta,
-                phi=phi
-            )
-
-            # Update the number of infected students, ensuring the number is capped by classroom capacity
-            current_infected[i, t] = max(0, min(allowed_students[i, t], expected_infections))
-
-    return R0_values
-
-# Define the plotting function
-def plot_threshold_behavior(R0_values, num_classrooms, time_steps):
-    plt.figure(figsize=(10, 6))
-
-    # Use a colormap to assign distinct colors to each classroom
-    colors = plt.cm.viridis(np.linspace(0, 1, num_classrooms))
-
-    # Plot R0 for each classroom with different colors
-    for i in range(num_classrooms):
-        plt.plot(R0_values[i], label=f"Classroom {i + 1}", color=colors[i])
-
-    # Plot the threshold line at R0 = 1
-    plt.axhline(y=1, color='r', linestyle='--', label='$R_0 = 1$ (Threshold)')
-
-    # Fill regions for DFE (R_0 < 1) and EE (R_0 > 1)
-    plt.fill_between(np.arange(time_steps), 0, 1, color='green', alpha=0.1, label="DFE Region (R_0 < 1)")
-    plt.fill_between(np.arange(time_steps), 1, np.max(R0_values), color='orange', alpha=0.1, label="EE Region (R_0 > 1)")
-
-    # Set plot labels and title
-    plt.xlabel("Time Steps")
-    plt.ylabel("$R_0$")
-    plt.title("Threshold Behavior of the Model (R_0 over time)")
-    plt.legend()
-    plt.grid(True)
-    plt.tight_layout()
-
-    # Save the plot as a PNG file
-    plt.savefig("threshold_behavior.png")
-    # plt.show()  # Uncomment this line to display the plot
-
-def plot_infection_dynamics(simulated_infected, num_classrooms, time_steps):
+# Function from the provided code - modified slightly for this analysis
+def simulate_infections_n_classrooms(n_classes, alpha_m, beta, phi, current_infected, allowed_students, community_risk):
     """
-    Plot the infection dynamics over time for each classroom based on the simulation.
+    Simulation function using the population game formulation.
+    """
+    new_infected = []
+    for i in range(n_classes):
+        current_inf = current_infected[i]
+        allowed = allowed_students[i]
+        comm_risk = community_risk[i]
+
+        # Within-classroom infections
+        in_class_term = alpha_m[i] * current_inf * allowed
+
+        # Community risk infections
+        community_term = beta[i] * comm_risk * (allowed ** 2)
+
+        # Compute average infection proportion from the other classrooms
+        other_props = []
+        for j in range(n_classes):
+            if i != j:
+                if allowed_students[j] > 0:
+                    other_props.append(current_infected[j] / allowed_students[j])
+                else:
+                    other_props.append(0)
+        avg_prop = np.mean(other_props) if other_props else 0
+
+        # Cross-classroom infections using the population game formulation
+        cross_class_term = phi * allowed * avg_prop
+
+        total_infected = in_class_term + community_term + cross_class_term
+
+        # Ensure the new infections do not exceed the number of allowed students
+        total_infected = np.minimum(total_infected, allowed)
+        new_infected.append(int(total_infected))
+    return new_infected
+
+
+# Generate stochastic community risk patterns
+def generate_community_risk_pattern(weeks=10, seed=None):
+    if seed is not None:
+        random.seed(seed)
+        np.random.seed(seed)
+
+    t = np.linspace(0, 2 * np.pi, weeks)
+    risk_pattern = np.zeros(weeks)
+
+    num_components = random.randint(1, 3)  # Use 1 to 3 sine components
+
+    # Generate the sine wave-based risk pattern
+    for _ in range(num_components):
+        amplitude = random.uniform(0.2, 0.4)
+        frequency = random.uniform(0.5, 2.0)
+        phase = random.uniform(0, 2 * np.pi)
+        risk_pattern += amplitude * np.sin(frequency * t + phase)
+
+    # Normalize and scale the risk pattern to range [0.1, 0.9]
+    risk_pattern = (risk_pattern - np.min(risk_pattern)) / (np.max(risk_pattern) - np.min(risk_pattern))
+    risk_pattern = 0.8 * risk_pattern + 0.1  # Scale to range [0.1, 0.9]
+
+    # Add some noise and clamp the values between 0.1 and 0.9
+    risk_pattern = [max(0.1, min(0.9, risk + random.uniform(-0.1, 0.1))) for risk in risk_pattern]
+
+    return risk_pattern
+
+
+# Simulate over time with fixed parameters
+def simulate_over_time(n_classes, alpha, beta, phi, initial_infected, allowed_students, community_risk_pattern,
+                       weeks=10):
+    """
+    Simulate the infection spread over time.
 
     Parameters:
-    simulated_infected (array): Simulated number of infected students in each classroom over time.
-    num_classrooms (int): Number of classrooms.
-    time_steps (int): Number of time steps in the simulation.
+    - n_classes: Number of classrooms
+    - alpha, beta, phi: Model parameters
+    - initial_infected: Initial number of infected students per classroom
+    - allowed_students: Number of students allowed per classroom
+    - community_risk_pattern: Time series of community risk values
+    - weeks: Number of weeks to simulate
+
+    Returns:
+    - List of infection counts for each classroom at each week
     """
-    plt.figure(figsize=(10, 6))
+    alpha_m = [alpha] * n_classes
+    beta_m = [beta] * n_classes
 
-    # Use a colormap to assign distinct colors to each classroom
-    colors = plt.cm.plasma(np.linspace(0, 1, num_classrooms))
+    infections_over_time = [initial_infected.copy()]
+    current_infected = initial_infected.copy()
 
-    # Plot the infection dynamics for each classroom
-    for i in range(num_classrooms):
-        plt.plot(simulated_infected[i], label=f"Classroom {i + 1}", color=colors[i])
+    for week in range(weeks):
+        # Use weekly community risk from pattern (cycling if needed)
+        current_risk = [community_risk_pattern[week % len(community_risk_pattern)]] * n_classes
 
-    # Set plot labels and title
-    plt.xlabel("Time Steps")
-    plt.ylabel("Number of Infected Students")
-    plt.title("Simulated Infection Dynamics in Classrooms Over Time")
+        current_infected = simulate_infections_n_classrooms(
+            n_classes, alpha_m, beta_m, phi,
+            current_infected, allowed_students, current_risk
+        )
+
+        infections_over_time.append(current_infected.copy())
+
+    return infections_over_time
+
+
+# Find fixed points of the system
+def find_fixed_points(alpha, beta, phi, community_risk, allowed_students):
+    """
+    Find the fixed points (equilibria) of the system for given parameters.
+
+    Returns:
+    - Array of fixed points (one per classroom)
+    """
+    n_classes = len(allowed_students)
+
+    # Define the fixed point equations
+    def fixed_point_equations(infected):
+        residuals = []
+        for i in range(n_classes):
+            # Average proportions from other classrooms
+            other_props = []
+            for j in range(n_classes):
+                if i != j:
+                    if allowed_students[j] > 0:
+                        other_props.append(infected[j] / allowed_students[j])
+                    else:
+                        other_props.append(0)
+            avg_prop = np.mean(other_props) if other_props else 0
+
+            # Calculate expected new infections
+            in_class_term = alpha * infected[i] * allowed_students[i]
+            community_term = beta * community_risk[i] * (allowed_students[i] ** 2)
+            cross_class_term = phi * allowed_students[i] * avg_prop
+
+            new_inf = in_class_term + community_term + cross_class_term
+            new_inf = min(new_inf, allowed_students[i])
+
+            # Fixed point: current = new
+            residuals.append(new_inf - infected[i])
+
+        return residuals
+
+    # Initial guess: 10% of allowed students are infected
+    initial_guess = [0.1 * allowed for allowed in allowed_students]
+
+    # Find roots of the equations
+    fixed_points = fsolve(fixed_point_equations, initial_guess)
+
+    # Ensure solutions are valid (non-negative and not exceeding allowed)
+    fixed_points = np.maximum(0, fixed_points)
+    fixed_points = np.minimum(fixed_points, allowed_students)
+
+    return fixed_points
+
+
+# Check stability of fixed points
+def check_stability(fixed_point, alpha, beta, phi, community_risk, allowed_students):
+    """
+    Check if a fixed point is stable by examining the eigenvalues of the Jacobian.
+
+    Returns:
+    - is_stable: Boolean indicating stability
+    - eigenvalues: Array of eigenvalues
+    """
+    n_classes = len(allowed_students)
+    J = np.zeros((n_classes, n_classes))
+
+    # Construct Jacobian matrix
+    for i in range(n_classes):
+        for j in range(n_classes):
+            if i == j:
+                # Self-influence term (diagonal)
+                J[i, i] = alpha * allowed_students[i] - 1
+            else:
+                # Cross-influence term (off-diagonal)
+                J[i, j] = phi * allowed_students[i] / allowed_students[j] / (n_classes - 1)
+
+    # Calculate eigenvalues
+    eigenvalues = np.linalg.eigvals(J)
+
+    # Stable if all real parts are negative
+    is_stable = all(np.real(eigenvalues) < 0)
+
+    return is_stable, eigenvalues
+
+
+# Analyze parameter space for uncontrolled system
+def analyze_uncontrolled_system(total_students, alpha_values, beta_values, phi_values):
+    """
+    Analyze the equilibrium behavior of the system with all students allowed.
+
+    Returns:
+    - Dictionary of results for each parameter combination
+    """
+    n_classes = 2  # Example with 2 classrooms
+    allowed_students = [total_students] * n_classes
+    community_risk = [0.5] * n_classes  # Medium risk
+
+    results = {}
+
+    for alpha in alpha_values:
+        for beta in beta_values:
+            for phi in phi_values:
+                key = (alpha, beta, phi)
+
+                # Find equilibrium infection levels
+                equilibrium = find_fixed_points(alpha, beta, phi, community_risk, allowed_students)
+
+                # Check stability
+                is_stable, eigenvalues = check_stability(equilibrium, alpha, beta, phi,
+                                                         community_risk, allowed_students)
+
+                # Calculate metrics
+                total_equilibrium_infections = sum(equilibrium)
+                infection_proportion = total_equilibrium_infections / (n_classes * total_students)
+
+                # Calculate effective R0
+                r0 = alpha * total_students + beta * 0.5 * (total_students ** 2)
+
+                # Is disease endemic?
+                is_endemic = total_equilibrium_infections > 1
+
+                results[key] = {
+                    "equilibrium_infections": equilibrium,
+                    "total_infections": total_equilibrium_infections,
+                    "infection_proportion": infection_proportion,
+                    "is_stable": is_stable,
+                    "eigenvalues": eigenvalues,
+                    "r0": r0,
+                    "is_endemic": is_endemic
+                }
+
+    return results
+
+
+# Test different control policies
+def test_action_impact(alpha, beta, phi, community_risk_pattern, initial_infected, total_students=100, weeks=10):
+    """
+    Test how different control policies (allowed students) affect outcomes.
+    """
+    n_classes = len(initial_infected)
+
+    policy_outcomes = {}
+    for capacity_pct in [0, 25, 50, 75, 100]:
+        capacity = int(total_students * capacity_pct / 100)
+        allowed = [capacity] * n_classes
+
+        timeline = simulate_over_time(
+            n_classes, alpha, beta, phi,
+            initial_infected, allowed, community_risk_pattern, weeks
+        )
+
+        final_infections = timeline[-1]
+        total_final = sum(final_infections)
+
+        policy_outcomes[capacity_pct] = {
+            "capacity": capacity,
+            "final_infections": final_infections,
+            "total_infections": total_final,
+            "infection_rate": total_final / max(sum(allowed), 1),
+            "timeline": timeline
+        }
+
+    return policy_outcomes
+
+
+# Evaluate control impact across parameter space
+def evaluate_control_impact(alpha_values, beta_values, phi_values):
+    """
+    Evaluate how effective control policies are across parameter space.
+    """
+    n_classes = 2
+    initial_infected = [5] * n_classes
+    total_students = 100
+
+    # Generate a fixed risk pattern for consistency
+    risk_pattern = generate_community_risk_pattern(weeks=15, seed=42)
+
+    results = {}
+
+    for alpha in alpha_values:
+        for beta in beta_values:
+            for phi in phi_values:
+                key = (alpha, beta, phi)
+
+                # Test different policies
+                policy_outcomes = test_action_impact(
+                    alpha, beta, phi, risk_pattern, initial_infected, total_students
+                )
+
+                # Calculate the range of outcomes
+                min_outcome = min([outcome["total_infections"] for outcome in policy_outcomes.values()])
+                max_outcome = max([outcome["total_infections"] for outcome in policy_outcomes.values()])
+                outcome_range = max_outcome - min_outcome
+
+                # Calculate control effectiveness
+                control_effectiveness = outcome_range / max(max_outcome, 1)
+
+                results[key] = {
+                    "policy_outcomes": policy_outcomes,
+                    "outcome_range": outcome_range,
+                    "control_effectiveness": control_effectiveness,
+                    "min_outcome": min_outcome,
+                    "max_outcome": max_outcome
+                }
+
+    return results
+
+
+# Plot the phase diagram
+def plot_phase_diagram(results, parameter_values, total_students):
+    alpha_values, beta_values, phi_values = parameter_values
+
+    # Create figure
+    fig = plt.figure(figsize=(18, 6))
+
+    # 1. Plot R0 values
+    ax1 = fig.add_subplot(131, projection='3d')
+    X, Y = np.meshgrid(alpha_values, beta_values)
+    Z = np.zeros((len(beta_values), len(alpha_values)))
+
+    # Use middle phi value for this plot
+    mid_phi = phi_values[len(phi_values) // 2]
+
+    for i, beta in enumerate(beta_values):
+        for j, alpha in enumerate(alpha_values):
+            Z[i, j] = results[(alpha, beta, mid_phi)]["r0"]
+
+    surf = ax1.plot_surface(X, Y, Z, cmap=cm.viridis)
+    ax1.set_xlabel('Alpha')
+    ax1.set_ylabel('Beta')
+    ax1.set_zlabel('R0')
+    ax1.set_title(f'Basic Reproduction Number (Phi={mid_phi})')
+    fig.colorbar(surf, ax=ax1, shrink=0.5, aspect=5)
+
+    # 2. Plot equilibrium infection proportion
+    ax2 = fig.add_subplot(132, projection='3d')
+    Z = np.zeros((len(beta_values), len(alpha_values)))
+
+    for i, beta in enumerate(beta_values):
+        for j, alpha in enumerate(alpha_values):
+            Z[i, j] = results[(alpha, beta, mid_phi)]["infection_proportion"]
+
+    surf = ax2.plot_surface(X, Y, Z, cmap=cm.viridis)
+    ax2.set_xlabel('Alpha')
+    ax2.set_ylabel('Beta')
+    ax2.set_zlabel('Infection Proportion')
+    ax2.set_title(f'Equilibrium Infection Proportion (Phi={mid_phi})')
+    fig.colorbar(surf, ax=ax2, shrink=0.5, aspect=5)
+
+    # 3. Plot phase space
+    ax3 = fig.add_subplot(133)
+    endemic_points = []
+    disease_free_points = []
+
+    for alpha in alpha_values:
+        for beta in beta_values:
+            r0 = results[(alpha, beta, mid_phi)]["r0"]
+            if r0 > 1:
+                endemic_points.append((alpha, beta))
+            else:
+                disease_free_points.append((alpha, beta))
+
+    if endemic_points:
+        endemic_points = np.array(endemic_points)
+        ax3.scatter(endemic_points[:, 0], endemic_points[:, 1], color='red', label='Endemic')
+
+    if disease_free_points:
+        disease_free_points = np.array(disease_free_points)
+        ax3.scatter(disease_free_points[:, 0], disease_free_points[:, 1], color='blue', label='Disease-Free')
+
+    ax3.set_xlabel('Alpha')
+    ax3.set_ylabel('Beta')
+    ax3.set_title(f'Phase Diagram (Phi={mid_phi})')
+    ax3.legend()
+
+    plt.tight_layout()
+    plt.savefig('phase_diagram.png', dpi=300)
+    plt.show()
+
+
+# Plot control effectiveness
+def plot_control_effectiveness(control_results, parameter_values):
+    alpha_values, beta_values, phi_values = parameter_values
+
+    # Middle phi value for 2D plots
+    mid_phi = phi_values[len(phi_values) // 2]
+
+    # Create a heatmap for control effectiveness
+    plt.figure(figsize=(15, 5))
+
+    # 1. Control effectiveness heatmap
+    plt.subplot(131)
+    Z = np.zeros((len(beta_values), len(alpha_values)))
+
+    for i, beta in enumerate(beta_values):
+        for j, alpha in enumerate(alpha_values):
+            Z[i, j] = control_results[(alpha, beta, mid_phi)]["control_effectiveness"]
+
+    plt.imshow(Z, extent=[min(alpha_values), max(alpha_values), min(beta_values), max(beta_values)],
+               aspect='auto', origin='lower', cmap='viridis')
+    plt.colorbar(label='Control Effectiveness')
+    plt.xlabel('Alpha')
+    plt.ylabel('Beta')
+    plt.title(f'Control Effectiveness (Phi={mid_phi})')
+
+    # 2. Outcome range heatmap
+    plt.subplot(132)
+    Z = np.zeros((len(beta_values), len(alpha_values)))
+
+    for i, beta in enumerate(beta_values):
+        for j, alpha in enumerate(alpha_values):
+            Z[i, j] = control_results[(alpha, beta, mid_phi)]["outcome_range"]
+
+    plt.imshow(Z, extent=[min(alpha_values), max(alpha_values), min(beta_values), max(beta_values)],
+               aspect='auto', origin='lower', cmap='viridis')
+    plt.colorbar(label='Outcome Range')
+    plt.xlabel('Alpha')
+    plt.ylabel('Beta')
+    plt.title(f'Range of Policy Outcomes (Phi={mid_phi})')
+
+    # 3. Policy comparison for a specific parameter set
+    plt.subplot(133)
+    good_alpha = alpha_values[len(alpha_values) // 2]
+    good_beta = beta_values[len(beta_values) // 2]
+    good_phi = phi_values[len(phi_values) // 2]
+
+    policy_outcomes = control_results[(good_alpha, good_beta, good_phi)]["policy_outcomes"]
+
+    for capacity_pct, outcome in policy_outcomes.items():
+        timeline = outcome["timeline"]
+        total_infections = [sum(week) for week in timeline]
+        plt.plot(range(len(timeline)), total_infections,
+                 label=f'{capacity_pct}% Capacity')
+
+    plt.xlabel('Weeks')
+    plt.ylabel('Total Infections')
+    plt.title(f'Policy Comparison (α={good_alpha}, β={good_beta}, φ={good_phi})')
     plt.legend()
-    plt.grid(True)
-    plt.tight_layout()
-
-    # Save the plot as a PNG file
-    plt.savefig("infection_dynamics.png")
-    # plt.show()  # Uncomment this line to display the plot
-
-def plot_allowed_vs_R0_curve(num_classrooms, alpha_m=2.0, beta=0.001, phi=0.005, max_students=100):
-    """
-    Plot Allowed vs R0 curve for each classroom, highlighting regions for DFE and EE with different shades.
-
-    Parameters:
-    num_classrooms (int): Number of classrooms.
-    alpha_m (float): Transmission rate within the classroom.
-    beta (float): Transmission rate from the community.
-    phi (float): Cross-classroom transmission rate.
-    max_students (int): Maximum number of allowed students.
-    """
-    # Calculate a mean community risk value from a fixed distribution
-    community_risk_mean = np.mean(np.random.uniform(0.5, 1.0, size=100))
-
-    # Generate the range of allowed student values
-    allowed_values = np.linspace(0, max_students, 100)
-    R0_values = np.zeros((num_classrooms, len(allowed_values)))
-
-    for i in range(num_classrooms):
-        for j, allowed in enumerate(allowed_values):
-            # Ensure that infected does not exceed allowed
-            infected = min(allowed, np.random.uniform(1, allowed))  # Random infected, constrained by allowed
-
-            # Recalculate R0 based on the varying allowed student values and the fixed community risk mean
-            within_classroom_R0 = alpha_m * infected  # Based on the number of infected
-            community_R0 = beta * community_risk_mean * allowed**2
-            cross_classroom_R0 = phi * infected  # Cross-classroom infections are still based on infected students
-
-            # Total R0 for the classroom
-            R0_values[i, j] = within_classroom_R0 + community_R0 + cross_classroom_R0
-
-    # Plotting the curves
-    plt.figure(figsize=(10, 6))
-
-    # Use a colormap to assign distinct colors to each classroom
-    colors = plt.cm.cool(np.linspace(0, 1, num_classrooms))
-    dfe_colors = plt.cm.Greens(np.linspace(0.3, 0.7, num_classrooms))  # Lighter shades for DFE
-    ee_colors = plt.cm.Oranges(np.linspace(0.3, 0.7, num_classrooms))  # Lighter shades for EE
-
-    # Plot R0 vs Allowed for each classroom
-    for i in range(num_classrooms):
-        plt.plot(allowed_values, R0_values[i], label=f"Classroom {i + 1}", color=colors[i])
-
-        # Fill regions for DFE (R_0 < 1) and EE (R_0 >= 1) with different shades for each classroom
-        plt.fill_between(allowed_values, 0, R0_values[i], where=(R0_values[i] < 1), color=dfe_colors[i], alpha=0.3,
-                         label=f"DFE Region - Classroom {i + 1}")
-        plt.fill_between(allowed_values, 1, R0_values[i], where=(R0_values[i] >= 1), color=ee_colors[i], alpha=0.3,
-                         label=f"EE Region - Classroom {i + 1}")
-
-    # Plot the threshold line at R0 = 1
-    plt.axhline(y=1, color='red', linestyle='--', label='$R_0 = 1$ (Threshold)')
-
-    # Set plot labels and title
-    plt.xlabel("Allowed Students")
-    plt.ylabel("$R_0$")
-    plt.title(f"Allowed vs $R_0$ for Classrooms\n"
-              f"($\\alpha_m$={alpha_m}, $\\beta$={beta}, $\\phi$={phi}, CR mean={community_risk_mean:.2f})")
-    plt.legend()
-    plt.grid(True)
-    plt.tight_layout()
-
-    # Save the plot as a PNG file
-    plt.savefig("allowed_vs_R0_curve_fixed.png")
-    # plt.show()  # Uncomment this line to display the plot
-
-
-
-
-def calculate_R0_surface(alpha_m, beta, phi, allowed, community_risk_mean):
-    """
-    Calculate R0 based on transmission rates and return the R0 values.
-    """
-    within_classroom_R0 = alpha_m * allowed  # Based on allowed students
-    community_R0 = beta * community_risk_mean * allowed**2
-    cross_classroom_R0 = phi * allowed  # Cross-classroom infections
-
-    # Total R0
-    R0 = within_classroom_R0 + community_R0 + cross_classroom_R0
-    return R0
-
-def plot_R0_surface_3D(allowed=100, community_risk_mean=0.74):
-    """
-    Plot the 3D surface plot to show how R0 changes with alpha_m, beta, and phi.
-
-    Parameters:
-    allowed (int): Number of allowed students.
-    community_risk_mean (float): The mean community risk factor.
-    """
-    # Create ranges for alpha_m, beta, and phi
-    alpha_m_values = np.linspace(0.001, 0.5, 50)  # Range for alpha_m
-    beta_values = np.linspace(0.0001, 0.01, 50)  # Range for beta
-    phi_values = np.linspace(0.001, 0.5, 50)  # Range for phi
-
-    # Create a meshgrid for alpha_m and beta
-    alpha_m_grid, beta_grid = np.meshgrid(alpha_m_values, beta_values)
-
-    # Calculate R0 values for each combination of alpha_m, beta, and phi
-    R0_values = np.zeros((len(alpha_m_values), len(beta_values), len(phi_values)))
-
-    for i in range(len(alpha_m_values)):
-        for j in range(len(beta_values)):
-            for k, phi in enumerate(phi_values):
-                R0_values[i, j, k] = calculate_R0_surface(alpha_m_values[i], beta_values[j], phi, allowed, community_risk_mean)
-
-    # Select a slice for phi to represent it on the z-axis
-    phi_slice = phi_values  # z-axis will represent phi values
-
-    # Calculate the mean R0 values for the 2D surface (averaging over phi)
-    mean_R0_values = np.mean(R0_values, axis=2)
-
-    # Create a figure for the plot
-    fig = plt.figure(figsize=(12, 8))
-    ax = fig.add_subplot(111, projection='3d')
-
-    # Plot the 3D surface with phi on the z-axis
-    surf = ax.plot_surface(alpha_m_grid, beta_grid, phi_slice[:, None], facecolors=plt.cm.viridis(mean_R0_values / np.max(mean_R0_values)), edgecolor='none')
-    ax.set_xlim(0, max(alpha_m_values))  # Set x-axis (alpha_m) limit from 0
-    ax.set_ylim(0, max(beta_values))  # Set y-axis (beta) limit from 0
-    ax.set_zlim(0, max(phi_values))
-
-    # Add horizontal color bar for the R0 values
-    mappable = plt.cm.ScalarMappable(cmap='viridis')
-    mappable.set_array(mean_R0_values)
-    cbar = fig.colorbar(mappable, ax=ax, shrink=0.7, orientation='horizontal', pad=0.1, label='$R_0$')
-
-    # Set axis labels
-    ax.set_xlabel(r'$\alpha_m$ (Within-classroom transmission rate)')
-    ax.set_ylabel(r'$\beta$ (Community transmission rate)')
-    ax.set_zlabel(r'$\phi$ (Cross-classroom transmission rate)')
-    ax.set_title('Surface Plot of $R_0$ Based on Transmission Rates')
 
     plt.tight_layout()
-    plt.savefig("R0_surface_plot_3D_updated.png")
-    # plt.show()  # Uncomment to display the plot
+    plt.savefig('control_effectiveness.png', dpi=300)
+    plt.show()
 
 
-# Main function to run the simulation
-def main():
-    # Simulation parameters
-    num_classrooms = 2  # Number of classrooms
-    time_steps = 52  # Number of time steps
-    max_students = 100  # Maximum number of students per classroom
+# Main analysis function
+def run_analysis():
+    print("Starting comprehensive epidemic model analysis...")
 
-    # Transmission rates
-    alpha_m = 0.01  # Transmission rate within the classroom
-    beta = 0.001  # Transmission rate from the community
-    phi = 0.000001 # Cross-classroom transmission rate
+    # 1. Parameter ranges to explore
+    alpha_values = np.logspace(-3, -1, 5)  # from 0.001 to 0.1
+    beta_values = np.logspace(-4, -2, 5)  # from 0.0001 to 0.01
+    phi_values = np.logspace(-5, -3, 3)  # from 0.00001 to 0.001
+    parameter_values = (alpha_values, beta_values, phi_values)
 
-    # Community risk values for each classroom over time (randomized for simulation)
-    np.random.seed(42)  # For reproducibility
-    community_risk = np.random.uniform(0.1, 1.0, (num_classrooms, time_steps))
+    # 2. Analyze uncontrolled system (all students allowed)
+    print("\nAnalyzing uncontrolled system...")
+    uncontrolled_results = analyze_uncontrolled_system(100, alpha_values, beta_values, phi_values)
 
-    # Number of students allowed in each classroom (assumed to be max_students for simplicity)
-    allowed_students = np.full((num_classrooms, time_steps), max_students)
+    # Print some key findings
+    print("\nSummary of uncontrolled system analysis:")
 
-    # Initialize infection dynamics for each classroom (initially 1 infected individual in each classroom)
-    current_infected = np.zeros((num_classrooms, time_steps))
-    current_infected[:, 0] = 1  # Start with 1 infected student per classroom
+    # Count endemic parameter combinations
+    endemic_count = sum(1 for result in uncontrolled_results.values() if result["is_endemic"])
+    total_combinations = len(uncontrolled_results)
+    print(
+        f"Endemic parameter combinations: {endemic_count}/{total_combinations} ({endemic_count / total_combinations * 100:.1f}%)")
 
-    # Run the simulation
-    R0_values = simulate_infection_dynamics(
-        allowed_students=allowed_students,
-        current_infected=current_infected,
-        community_risk=community_risk,
-        num_classrooms=num_classrooms,
-        time_steps=time_steps,
-        alpha_m=alpha_m,
-        beta=beta,
-        phi=phi
-    )
+    # Find highest and lowest infection proportions
+    max_prop = max(uncontrolled_results.values(), key=lambda x: x["infection_proportion"])
+    min_prop = min(uncontrolled_results.values(), key=lambda x: x["infection_proportion"])
+    print(
+        f"Highest infection proportion: {max_prop['infection_proportion']:.2f} at α={max_prop['equilibrium_infections'][0]:.4f}, β={max_prop['equilibrium_infections'][1]:.4f}")
+    print(
+        f"Lowest infection proportion: {min_prop['infection_proportion']:.2f} at α={min_prop['equilibrium_infections'][0]:.4f}, β={min_prop['equilibrium_infections'][1]:.4f}")
 
-    # Plot the threshold behavior of R0 over time
-    plot_threshold_behavior(R0_values, num_classrooms, time_steps)
+    # 3. Evaluate control impact
+    print("\nEvaluating control impact across parameter space...")
+    control_results = evaluate_control_impact(alpha_values, beta_values, phi_values)
 
-    # Plot the infection dynamics using the simulated infected data
-    plot_infection_dynamics(current_infected, num_classrooms, time_steps)
+    # Find parameter combinations with highest and lowest control effectiveness
+    max_control = max(control_results.items(), key=lambda x: x[1]["control_effectiveness"])
+    min_control = min(control_results.items(), key=lambda x: x[1]["control_effectiveness"])
 
-    # Plot Allowed vs R0 for both classrooms, showing DFE and EE regions
-    plot_allowed_vs_R0_curve(num_classrooms, alpha_m, beta, phi, max_students)
+    print("\nSummary of control impact analysis:")
+    print(f"Highest control effectiveness: {max_control[1]['control_effectiveness']:.2f}")
+    print(f"   at α={max_control[0][0]:.4f}, β={max_control[0][1]:.4f}, φ={max_control[0][2]:.6f}")
+    print(f"   outcome range: {max_control[1]['outcome_range']:.1f}")
 
-    plot_R0_surface_3D(100, 0.4)
+    print(f"Lowest control effectiveness: {min_control[1]['control_effectiveness']:.2f}")
+    print(f"   at α={min_control[0][0]:.4f}, β={min_control[0][1]:.4f}, φ={min_control[0][2]:.6f}")
+    print(f"   outcome range: {min_control[1]['outcome_range']:.1f}")
+
+    # 4. Visualize results
+    print("\nGenerating phase diagram...")
+    plot_phase_diagram(uncontrolled_results, parameter_values, 100)
+
+    print("\nGenerating control effectiveness visualization...")
+    plot_control_effectiveness(control_results, parameter_values)
+
+    # 5. Analyze RL suitability
+    print("\nAnalyzing RL suitability...")
+    suitable_params = []
+    unsuitable_params = []
+
+    for params, result in control_results.items():
+        alpha, beta, phi = params
+
+        # Check if system satisfies RL suitability criteria
+        is_suitable = (
+                result["control_effectiveness"] > 0.2 and  # Control matters
+                uncontrolled_results[params]["r0"] > 1.0 and  # Disease can spread
+                uncontrolled_results[params]["infection_proportion"] < 0.9  # Not overwhelming
+        )
+
+        if is_suitable:
+            suitable_params.append(params)
+        else:
+            unsuitable_params.append(params)
+
+    print(f"\nRL-suitable parameter combinations: {len(suitable_params)}/{total_combinations}")
+    if suitable_params:
+        print("\nExample suitable parameter combinations:")
+        for i, params in enumerate(suitable_params[:3]):
+            alpha, beta, phi = params
+            print(f"{i + 1}. α={alpha:.4f}, β={beta:.4f}, φ={phi:.6f}")
+            print(f"   R0: {uncontrolled_results[params]['r0']:.2f}")
+            print(f"   Control effectiveness: {control_results[params]['control_effectiveness']:.2f}")
+            print(f"   Equilibrium infection proportion: {uncontrolled_results[params]['infection_proportion']:.2f}")
+
+    # 6. Detailed analysis of an RL-suitable parameter set
+    if suitable_params:
+        # Pick the most suitable parameter combination
+        best_params = max(suitable_params, key=lambda p: control_results[p]["control_effectiveness"])
+        alpha, beta, phi = best_params
+
+        print(f"\nDetailed analysis of most suitable parameter combination:")
+        print(f"α={alpha:.4f}, β={beta:.4f}, φ={phi:.6f}")
+
+        # Generate a stochastic risk pattern
+        risk_pattern = generate_community_risk_pattern(weeks=20, seed=42)
+
+        # Test impact of stochastic risk
+        n_classes = 2
+        initial_infected = [5] * n_classes
+        allowed_students = [50] * n_classes
+
+        print("\nSimulating with stochastic community risk...")
+        timeline = simulate_over_time(
+            n_classes, alpha, beta, phi,
+            initial_infected, allowed_students, risk_pattern, weeks=20
+        )
+
+        # Plot the timeline with stochastic risk
+        plt.figure(figsize=(10, 6))
+        total_infections = [sum(week) for week in timeline]
+        plt.plot(range(len(timeline)), total_infections, label='Total Infections')
+
+        # Also plot the risk pattern
+        risk_scaled = [r * 100 for r in risk_pattern]  # Scale for visibility
+        plt.plot(range(len(risk_pattern)), risk_scaled, 'r--', label='Community Risk (×100)')
+
+        plt.xlabel('Weeks')
+        plt.ylabel('Count')
+        plt.title('Infection Timeline with Stochastic Community Risk')
+        plt.legend()
+        plt.savefig('stochastic_simulation.png', dpi=300)
+        plt.show()
+
+        # Final recommendations
+        print("\nFinal Recommendations for RL Application:")
+        print(f"1. Recommended parameter ranges:")
+        print(f"   α: {min([p[0] for p in suitable_params]):.4f} - {max([p[0] for p in suitable_params]):.4f}")
+        print(f"   β: {min([p[1] for p in suitable_params]):.4f} - {max([p[1] for p in suitable_params]):.4f}")
+        print(f"   φ: {min([p[2] for p in suitable_params]):.6f} - {max([p[2] for p in suitable_params]):.6f}")
+
+        print(f"\n2. Most promising parameter combination:")
+        print(f"   α={best_params[0]:.4f}, β={best_params[1]:.4f}, φ={best_params[2]:.6f}")
+
+        print(f"\n3. System characteristics with these parameters:")
+        print(f"   - Basic reproduction number: {uncontrolled_results[best_params]['r0']:.2f}")
+        print(f"   - Control effectiveness: {control_results[best_params]['control_effectiveness']:.2f}")
+        print(f"   - Equilibrium infection proportion: {uncontrolled_results[best_params]['infection_proportion']:.2f}")
+
+        print("\n4. Recommended RL approach:")
+        print("   - Multi-agent RL with coordination mechanisms")
+        print("   - State representation should include both local (classroom) and global (community risk) information")
+        print("   - Reward shaping to balance education goals (max students) with health goals (min infections)")
+        print("   - Algorithms should handle stochastic transitions due to varying community risk")
+
+    print("\nAnalysis complete.")
 
 
 if __name__ == "__main__":
-    main()
+    run_analysis()

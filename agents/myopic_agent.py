@@ -1,168 +1,317 @@
-import os
-import numpy as np
 import torch
-import random
-import csv
-import pandas as pd
-from utils.visualization import visualize_myopic_states as visualize_myopic_agents
-import matplotlib.pyplot as plt
-import colorsys
+import itertools
 
-# Global SEED variable for reproducibility
-SEED = 42
-random.seed(SEED)
-np.random.seed(SEED)
-torch.manual_seed(SEED)
 
-class MyopicPolicy:
-    def __init__(self, env):
-        self.save_path = "myopic_results"
-        os.makedirs(self.save_path, exist_ok=True)
-        self.env = env  # Reference to the environment
+class MyopicAgent:
+    def __init__(self, agents, reward_mix_alpha=0.5, allowed_values=None):
+        self.agents = agents
+        self.reward_mix_alpha = reward_mix_alpha
+        self.allowed_values = torch.tensor(allowed_values, dtype=torch.float32)
 
-        # Initialize the allowed values directly from the environment's action space for each classroom
-        self.allowed_values_per_agent = {
-            agent: torch.tensor([env._map_action_to_allowed_students(action, i)
-                                 for action in range(env.action_spaces[agent].n)])
-            for i, agent in enumerate(env.agents)
-        }
+        # Shared parameters for all classrooms
+        self.alpha_m = 0.008  # In-class transmission
+        self.beta = 0.01  # Community transmission
+        self.delta = 0.3  # Cross-classroom transmission rate per shared student
 
-    def get_label(self, num_infected, community_risk, agent, alpha):
+        # Define the fraction of shared students between classes
+        self.shared_student_fraction = 0.3  # 20% of students are shared between classes
+
+        self.episode_rewards = {agent: [] for agent in agents}
+
+    def estimate_infected_students(self, agent_idx, current_infected_all, allowed_students_all, community_risk):
         """
-        Evaluate all possible actions (allowed student levels) and return the action that maximizes the reward.
+        Estimate NEW infections with emphasis on shared students between classrooms.
+        This model assumes classrooms have similar capacities (around 100 students).
 
-        Args:
-            num_infected (torch.Tensor): The number of currently infected students.
-            community_risk (torch.Tensor): The community risk value.
-            agent (str): The agent (classroom) to evaluate.
-            alpha (float): Weighting factor for reward calculation.
+        Parameters:
+        - agent_idx: Index of the current classroom
+        - current_infected_all: List of current infected counts for all classrooms
+        - allowed_students_all: List of allowed student counts for all classrooms
+        - community_risk: External risk factor from the community
 
         Returns:
-            label (int): The best action (index of the action) based on the reward.
-            allowed_value (float): The corresponding allowed students for the best action.
-            new_infected (float): The resulting number of new infections.
-            reward (float): The maximum reward.
+        - Estimated number of NEW infected students
         """
-        allowed_values = torch.FloatTensor(self.env.action_levels[self.env.agents.index(agent)])
-        num_actions = len(allowed_values)
+        current_inf = current_infected_all[agent_idx]
+        allowed = allowed_students_all[agent_idx]
 
-        # Initialize variables to store the best action
-        label = None
-        max_reward = -float('inf')
-        best_allowed_value = None
-        best_new_infected = None
+        # If no students are allowed, no infections can occur
+        if allowed == 0:
+            return 0
 
-        # Iterate over all possible actions
-        for i, allowed_value in enumerate(allowed_values):
-            # Ensure actions dictionary has all agents
-            actions = {a: i for a in self.env.agents}  # Action for all agents (even if only one is evaluated at a time)
+        # Within-classroom infections - linear scaling
+        in_class_term = self.alpha_m * current_inf * allowed
 
-            # Take a step in the environment using the actions for all agents
-            next_obs, rewards, dones, _ = self.env.step(actions)
+        # Community risk - quadratic scaling with allowed students
+        community_term = self.beta * community_risk * (allowed ** 2)
 
-            # Get the reward for the current agent
-            reward = rewards[agent]
+        # Cross-classroom transmission through shared students
+        cross_class_term = 0.0
+        for other_idx in range(len(current_infected_all)):
+            if other_idx != agent_idx:
+                other_allowed = allowed_students_all[other_idx]
+                other_infected = current_infected_all[other_idx]
 
-            # Update the best action if the current reward is better
-            if reward > max_reward:
-                max_reward = reward
-                label = i
-                best_allowed_value = allowed_value.item()
-                best_new_infected = next_obs[agent][0]  # The first element of observation is infected students
+                # Skip if other classroom has no students or infections
+                if other_allowed == 0 or other_infected == 0:
+                    continue
 
-        return label, best_allowed_value, best_new_infected, max_reward
+                # Calculate the number of shared students between classrooms
+                shared_students = int(allowed * self.shared_student_fraction)
 
-    def evaluate(self, env, run_name, num_episodes=1, alpha=0.5, csv_path=None):
+                infection_probability = other_infected / other_allowed
+
+                # Expected number of newly infected shared students
+                infected_shared = self.delta * infection_probability * shared_students
+
+                # Add to the cross-classroom term
+                cross_class_term += infected_shared
+
+        # Calculate new infections from all sources
+        new_infections = in_class_term + community_term + cross_class_term
+
+        # The estimated infections should never exceed the allowed capacity
+        estimated_infections = min(new_infections, allowed)
+
+
+
+        return estimated_infections
+    def estimate_reward(self, agent_idx, allowed, infected, env_gamma):
+        """Calculate reward using the environment's gamma parameter."""
+        return env_gamma * allowed - (1 - env_gamma) * infected
+
+    def get_best_joint_actions(self, current_infected_all, community_risk, env_gamma):
+        """Find the best joint actions for all agents by evaluating all combinations."""
+        num_agents = len(self.agents)
+        num_actions = len(self.allowed_values)
+
+        # Generate all possible joint actions
+        action_combinations = list(itertools.product(range(num_actions), repeat=num_agents))
+
+        best_reward = float('-inf')
+        best_combination = None
+
+        for action_combo in action_combinations:
+            allowed_students_all = [self.allowed_values[action].item() for action in action_combo]
+
+            rewards = []
+            for i in range(num_agents):
+                new_infected = self.estimate_infected_students(
+                    i, current_infected_all, allowed_students_all, community_risk)
+                reward = self.estimate_reward(i, allowed_students_all[i], new_infected, env_gamma)
+                rewards.append(reward)
+
+            global_reward = sum(rewards) / num_agents
+
+            if global_reward > best_reward:
+                best_reward = global_reward
+                best_combination = action_combo
+
+        return {i: action for i, action in enumerate(best_combination)}
+
+    def get_label(self, infected, community_risk, agent, reward_mix_alpha, env_gamma, recursion=True):
         """
-        Evaluate the myopic policy across all possible combinations of infected students and community risk.
+        Determine the best action for a classroom using a mixed objective.
+        The agent's objective is a weighted combination of local reward and overall social welfare.
         """
-        total_rewards = []
-        allowed_values_over_time = []
-        infected_values_over_time = []
+        agent_idx = int(agent.split('_')[1])
+        num_agents = len(self.agents)
 
-        # Define continuous ranges for infected students and community risk
-        infected_range = np.linspace(0, env.total_students, 100)  # Infected students from 0 to 100 in 100 steps
-        community_risk_range = np.linspace(0, 1, 100)  # Community risk from 0 to 1 in 100 steps
+        # Base Case for other agents (when recursion is disabled)
+        if not recursion:
+            best_action = None
+            best_reward = float('-inf')
+            best_allowed = None
+            best_infected = None
+            current_infected_all = [infected] * num_agents
 
-        # Iterate through all episodes (in this case we can only use one, since it's immediate reward-based)
-        for episode in range(num_episodes):
-            total_reward = 0
+            for action in range(len(self.allowed_values)):
+                allowed = self.allowed_values[action].item()
+                test_allowed_students = [self.allowed_values[1].item()] * num_agents
+                test_allowed_students[agent_idx] = allowed
+                new_infected = self.estimate_infected_students(
+                    agent_idx, current_infected_all, test_allowed_students, community_risk)
+                reward_val = self.estimate_reward(agent_idx, allowed, new_infected, env_gamma)
 
-            # Iterate through all possible combinations of infected and community risk
-            for infected in infected_range:
-                for community_risk in community_risk_range:
-                    actions = {}
-                    obs = {}
+                if reward_val > best_reward:
+                    best_action = action
+                    best_reward = reward_val
+                    best_allowed = allowed
+                    best_infected = new_infected
 
-                    # Create observations for all agents based on infected and community risk
-                    for agent in env.agents:
-                        obs[agent] = [infected, community_risk * 100]  # Normalize community risk for the environment
+            return best_action, best_allowed, best_infected, best_reward
 
-                    # Iterate over agents to evaluate all possible actions and select the best one
-                    for agent in env.agents:
-                        num_infected = torch.FloatTensor([obs[agent][0]])  # Get infected value for the agent
-                        community_risk_value = torch.FloatTensor([obs[agent][1] / 100])  # Get community risk (0 to 1)
+        # Pure Strategies
+        if reward_mix_alpha == 0:  # Purely local (selfish) strategy
+            best_action = None
+            best_reward = float('-inf')
+            best_allowed = None
+            best_infected = None
+            current_infected_all = [infected] * num_agents
 
-                        # Evaluate all actions and get the best action based on immediate reward
-                        best_action, allowed_value, new_infected, reward = self.get_best_action(env,
-                                                                                                num_infected,
-                                                                                                community_risk_value,
-                                                                                                alpha
-                                                                                                )
+            for action in range(len(self.allowed_values)):
+                allowed = self.allowed_values[action].item()
+                test_allowed_students = [0] * num_agents
+                test_allowed_students[agent_idx] = allowed
 
-                        # Store the selected action
-                        actions[agent] = best_action
+                for other_idx in range(num_agents):
+                    if other_idx != agent_idx:
+                        best_other_reward = float('-inf')
+                        best_other_action = 0
+                        for other_action in range(len(self.allowed_values)):
+                            other_allowed = self.allowed_values[other_action].item()
+                            test_allowed_students[other_idx] = other_allowed
+                            other_infected = self.estimate_infected_students(
+                                other_idx, current_infected_all, test_allowed_students, community_risk)
+                            other_reward = self.estimate_reward(
+                                other_idx, other_allowed, other_infected, env_gamma)
+                            if other_reward > best_other_reward:
+                                best_other_reward = other_reward
+                                best_other_action = other_action
+                        test_allowed_students[other_idx] = self.allowed_values[best_other_action].item()
 
-                        # Accumulate total rewards and track values over time
-                        allowed_values_over_time.append(allowed_value)
-                        infected_values_over_time.append(new_infected)
+                new_infected = self.estimate_infected_students(
+                    agent_idx, current_infected_all, test_allowed_students, community_risk)
+                local_reward = self.estimate_reward(agent_idx, allowed, new_infected, env_gamma)
 
-                        total_reward += sum(reward.values())
+                if local_reward > best_reward:
+                    best_action = action
+                    best_reward = local_reward
+                    best_allowed = allowed
+                    best_infected = new_infected
 
+            return best_action, best_allowed, best_infected, best_reward
 
+        elif reward_mix_alpha == 1:  # Purely cooperative strategy
+            current_infected_all = [infected] * num_agents
+            best_joint_actions = self.get_best_joint_actions(current_infected_all, community_risk, env_gamma)
+            best_action = best_joint_actions[agent_idx]
+            best_allowed = self.allowed_values[best_action].item()
+            joint_allowed = [self.allowed_values[best_joint_actions[i]].item() for i in range(num_agents)]
+            best_infected = self.estimate_infected_students(
+                agent_idx, current_infected_all, joint_allowed, community_risk)
+            best_reward = self.estimate_reward(agent_idx, best_allowed, best_infected, env_gamma)
 
-            total_rewards.append(total_reward)
+            return best_action, best_allowed, best_infected, best_reward
 
-        avg_reward = np.mean(total_rewards)
-        print(f"Average Reward over {num_episodes} episodes: {avg_reward}")
-        return avg_reward
+        else:  # Mixed Strategy (0 < reward_mix_alpha < 1)
+            current_infected_all = [infected] * num_agents
 
-    def get_best_action(self, env, infected, community_risk, alpha):
+            # Compute cooperative baseline
+            baseline_joint = self.get_best_joint_actions(current_infected_all, community_risk, env_gamma)
+            baseline_allowed = self.allowed_values[baseline_joint[agent_idx]].item()
+            baseline_test = [self.allowed_values[baseline_joint[i]].item() for i in range(num_agents)]
+            baseline_infected = self.estimate_infected_students(
+                agent_idx, current_infected_all, baseline_test, community_risk)
+            baseline_local_reward = self.estimate_reward(agent_idx, baseline_allowed, baseline_infected, env_gamma)
+            baseline_global_reward = sum(
+                self.estimate_reward(
+                    i, baseline_test[i],
+                    self.estimate_infected_students(i, current_infected_all, baseline_test, community_risk),
+                    env_gamma)
+                for i in range(num_agents)
+            ) / num_agents
+
+            best_action = None
+            best_obj = float('-inf')
+            best_allowed = None
+            best_infected = None
+
+            # Evaluate each candidate action
+            for action in range(len(self.allowed_values)):
+                candidate_allowed = self.allowed_values[action].item()
+                candidate_test = baseline_test.copy()
+                candidate_test[agent_idx] = candidate_allowed
+
+                candidate_infected = self.estimate_infected_students(
+                    agent_idx, current_infected_all, candidate_test, community_risk)
+                candidate_local_reward = self.estimate_reward(
+                    agent_idx, candidate_allowed, candidate_infected, env_gamma)
+                candidate_global_reward = sum(
+                    self.estimate_reward(
+                        i, candidate_test[i],
+                        self.estimate_infected_students(i, current_infected_all, candidate_test, community_risk),
+                        env_gamma)
+                    for i in range(num_agents)
+                ) / num_agents
+
+                # Mixed objective using cooperative baseline
+                penalty = (1 - reward_mix_alpha) * max(0, baseline_local_reward - candidate_local_reward)
+                mixed_obj = reward_mix_alpha * candidate_global_reward + \
+                            (1 - reward_mix_alpha) * candidate_local_reward - penalty
+
+                if mixed_obj > best_obj:
+                    best_obj = mixed_obj
+                    best_action = action
+                    best_allowed = candidate_allowed
+                    best_infected = candidate_infected
+
+            return best_action, best_allowed, best_infected, best_obj
+
+    def select_best_action(self, agent, state, env_gamma):
+        """Select best action for the given state."""
+        infected, community_risk = state
+        best_action, _, _, _ = self.get_label(
+            infected, community_risk, agent, self.reward_mix_alpha, env_gamma)
+        return best_action
+
+    def evaluate(self, env, num_episodes=1, max_steps=30):
         """
-        Evaluate all possible actions for each agent at the given state (infected, community risk)
-        and return the best action based on the immediate reward.
+        Evaluate the myopic policy for a single episode.
+        Assumes env was initialized with eval_mode=True to use the external community risk data.
         """
-        best_actions = {}
-        max_rewards = {}
-        allowed_values = {}
-        new_infected_values = {}
-
-        # Initialize the best rewards to negative infinity
-        for agent in env.agents:
-            max_rewards[agent] = -float('inf')
-
-        # Iterate over all possible actions for all agents within their valid action spaces
-        for action_combination in range(min(env.action_spaces[env.agents[0]].n, len(env.allowed_students))):
-            actions = {agent: action_combination for agent in env.agents}  # Set actions for all agents
-
-            # Step the environment with the current action combination
-            next_obs, rewards, dones, _ = env.step(actions)
-
-            # Iterate over agents to track the best action for each
-            for agent in env.agents:
-                reward = rewards[agent]
-
-                # If the reward is greater than the previous max, update it
-                if reward > max_rewards[agent]:
-                    max_rewards[agent] = reward
-                    best_actions[agent] = action_combination
-                    allowed_values[agent] = env.allowed_students[action_combination]
-                    new_infected_values[agent] = next_obs[agent][0]  # New infected value for the agent
-
-        return best_actions, allowed_values, new_infected_values, max_rewards
-
-
-
+        states = env.reset()
+        episode_rewards = {agent: 0 for agent in self.agents}
+        evaluation_data = {
+            'steps': [],
+            'agents': {},
+        }
+        for agent in self.agents:
+            evaluation_data['agents'][agent] = {
+                'rewards': [],
+                'actions': [],
+                'infected': [],
+                'allowed_students': [],
+                'cross_class_infections': []
+            }
+        for step in range(max_steps):
+            actions = {}
+            for agent in self.agents:
+                actions[agent] = self.select_best_action(agent, states[agent], env.gamma)
+                evaluation_data['agents'][agent]['infected'].append(states[agent][0])
+                evaluation_data['agents'][agent]['actions'].append(actions[agent])
+                evaluation_data['agents'][agent]['allowed_students'].append(
+                    self.allowed_values[actions[agent]].item()
+                )
+            next_states, rewards, dones, _ = env.step(actions)
+            allowed_students_all = [self.allowed_values[actions[a]].item() for a in self.agents]
+            current_infected_all = [states[a][0] for a in self.agents]
+            for i, agent in enumerate(self.agents):
+                cross_class_term = 0.0
+                for other_idx in range(len(current_infected_all)):
+                    if other_idx != i:
+                        other_allowed = allowed_students_all[other_idx]
+                        other_infected = current_infected_all[other_idx]
+                        if other_allowed == 0 or other_infected == 0:
+                            continue
+                        shared_students = int(allowed_students_all[i] * self.shared_student_fraction)
+                        infection_probability = other_infected / other_allowed
+                        infected_shared = self.delta * infection_probability * shared_students
+                        cross_class_term += infected_shared
+                evaluation_data['agents'][agent]['cross_class_infections'].append(cross_class_term)
+                episode_rewards[agent] += rewards[agent]
+                evaluation_data['agents'][agent]['rewards'].append(rewards[agent])
+            evaluation_data['steps'].append(step)
+            states = next_states
+            if all(dones.values()):
+                break
+        evaluation_data['total_rewards'] = episode_rewards
+        for agent in self.agents:
+            self.episode_rewards[agent].append(episode_rewards[agent])
+        print("\nMyopic Agent Evaluation Results:")
+        for agent, reward in episode_rewards.items():
+            print(f"{agent}: {reward:.2f}")
+        return evaluation_data
 
 
 

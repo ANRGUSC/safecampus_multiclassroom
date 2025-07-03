@@ -6,303 +6,716 @@ import random
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 import os
+import math
 
-class DQNetwork(nn.Module):
-    def __init__(self, input_dim, action_space_size):
-        super(DQNetwork, self).__init__()
-        self.input_dim = input_dim
-        self.action_space_size = action_space_size
-        self.hidden_layers = 3
-        self.hidden_dim = 16
-        self.build_network()
-        self.initialize_weights()
-
-    def build_network(self):
+# --------------------- Centralized Q-Network (Critic) Definition ---------------------
+class CentralizedDQNetwork(nn.Module):
+    def __init__(self, num_agents, state_dim, action_space_size, hidden_dim=16, hidden_layers=2):
+        """
+        This network takes the concatenated joint state of all agents as input
+        and produces a separate Q-value vector (of length action_space_size) for each agent.
+        """
+        super(CentralizedDQNetwork, self).__init__()
+        self.num_agents = num_agents
+        input_dim = num_agents * state_dim
         layers = []
-        prev_dim = self.input_dim
-
-        for _ in range(self.hidden_layers):
-            layers.append(nn.Linear(prev_dim, self.hidden_dim))
+        prev_dim = input_dim
+        for _ in range(hidden_layers):
+            layers.append(nn.Linear(prev_dim, hidden_dim))
             layers.append(nn.ReLU())
-            prev_dim = self.hidden_dim
+            prev_dim = hidden_dim
+        self.shared_layers = nn.Sequential(*layers)
+        # Create separate output heads for each agent.
+        self.agent_heads = nn.ModuleList([nn.Linear(prev_dim, action_space_size) for _ in range(num_agents)])
 
-        layers.append(nn.Linear(prev_dim, self.action_space_size))
-        self.network = nn.Sequential(*layers)
 
-    def initialize_weights(self):
-        for layer in self.network:
-            if isinstance(layer, nn.Linear):
-                nn.init.constant_(layer.weight, 0)
-                nn.init.constant_(layer.bias, 0)
+    def forward(self, joint_state):
+        """
+        joint_state: Tensor of shape (batch, num_agents * state_dim)
+        Returns: Tensor of shape (batch, num_agents, action_space_size)
+        """
+        shared_features = self.shared_layers(joint_state)
+        outputs = []
+        for head in self.agent_heads:
+            outputs.append(head(shared_features))
+        return torch.stack(outputs, dim=1)
 
-    def forward(self, state):
-        return self.network(state)
-
+# --------------------- CTDE DQNAgent with Multi-Step TD Returns and Penalty ---------------------
 class DQNAgent:
-    def __init__(self, agents, state_dim, action_space_size, learning_rate=0.1, discount_factor=0.99,
-                 epsilon=1.0, epsilon_decay=0.99, min_epsilon=0.0001, batch_size=64, memory_size=10000):
+    def __init__(self, agents, state_dim, action_space_size, reward_mix_alpha=0.5,
+                 learning_rate=0.002, epsilon=1.0, epsilon_decay=0.995, min_epsilon=0.0001,
+                 gamma=0.99, use_ctde=True, n_step=2, seed=None, hidden_dim=32, hidden_layers=3):
+        """
+        CTDE: Centralized Training with Decentralized Execution.
+        """
+        if seed is not None:
+            torch.manual_seed(seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(seed)
+        self.seed = seed
         self.agents = agents
+        self.num_agents = len(agents)
         self.state_dim = state_dim
         self.action_space_size = action_space_size
+        self.reward_mix_alpha = reward_mix_alpha
         self.learning_rate = learning_rate
-        self.discount_factor = discount_factor
-        self.epsilon = epsilon
+        self.epsilon = epsilon  # initial exploration probability
         self.epsilon_decay = epsilon_decay
         self.min_epsilon = min_epsilon
-        self.batch_size = batch_size
-        self.memory_size = memory_size
-        self.memory = []
+        self.gamma = gamma
+        self.use_ctde = use_ctde
+        self.n_step = n_step
+        self.hidden_dim = hidden_dim
+        self.hidden_layers = hidden_layers
 
-        self.networks = {agent: DQNetwork(state_dim, action_space_size) for agent in agents}
-        self.target_networks = {agent: DQNetwork(state_dim, action_space_size) for agent in agents}
-        self.optimizers = {agent: optim.Adam(self.networks[agent].parameters(), lr=learning_rate) for agent in agents}
-
-        for agent in self.agents:
-            self.target_networks[agent].load_state_dict(self.networks[agent].state_dict())
+        # Centralized Q-network (critic) used during training
+        self.network = CentralizedDQNetwork(self.num_agents, state_dim, action_space_size, hidden_dim=hidden_dim, hidden_layers=hidden_layers)
+        self.target_network = CentralizedDQNetwork(self.num_agents, state_dim, action_space_size, hidden_dim=hidden_dim, hidden_layers=hidden_layers)
+        self.optimizer = optim.Adam(self.network.parameters(), lr=learning_rate)
+        self.target_network.load_state_dict(self.network.state_dict())
 
         self.episode_rewards = {agent: [] for agent in agents}
         self.global_rewards = []
-        self.unique_states = {agent: set() for agent in agents}
+        self.action_values = None  # to be set in train() using env.action_levels
+
+        # Transition buffer for multi-step updates.
+        # Each item is a tuple: (joint_state, actions, rewards, next_joint_state, done)
+        self.transition_buffer = []
+
+    def select_local_action(self, agent, state):
+        """
+        Decentralized execution using ε-greedy + argmax.
+        """
+        idx = self.agents.index(agent)
+        # build a joint‐state vector but only fill this agent’s slot:
+        inp = torch.zeros(1, self.num_agents * self.state_dim)
+        st = torch.FloatTensor(state).unsqueeze(0)
+        start = idx * self.state_dim
+        inp[0, start:start + self.state_dim] = st
+
+        if random.random() < self.epsilon:
+            return random.randrange(self.action_space_size)
+
+        with torch.no_grad():
+            q_all = self.network(inp)  # shape (1, N, A)
+            q_i = q_all[0, idx]  # shape (A,)
+        return int(q_i.argmax().item())
+
+    def select_joint_actions(self, joint_state):
+        """
+        CTDE joint action selection with pure ε-greedy + argmax per agent.
+        """
+        js = torch.FloatTensor(joint_state).unsqueeze(0)  # (1, N * S)
+        with torch.no_grad():
+            q_all = self.network(js)[0]  # (N, A)
+
+        acts = []
+        for i in range(self.num_agents):
+            if random.random() < self.epsilon:
+                acts.append(random.randrange(self.action_space_size))
+            else:
+                acts.append(int(q_all[i].argmax().item()))
+        return acts
+
+    def select_local_action_eval(self, agent, state):
+        """
+        Greedy evaluation (ε=0).
+        """
+        return self.select_local_action(agent, state)
 
     def select_action(self, agent, state):
-        if random.random() < self.epsilon:
-            return random.randint(0, self.action_space_size - 1)
-        else:
-            state_tensor = torch.FloatTensor(state).unsqueeze(0)
-            q_values = self.networks[agent](state_tensor)
-            return torch.argmax(q_values).item()
-
-    def normalize_reward(self, rewards):
         """
-        Normalize a batch of rewards to have mean 0 and standard deviation 1.
-        Add a small epsilon to prevent division by zero.
+        For visualization (decentralized execution), use the local state.
+        The 'joint_state' parameter is ignored.
         """
-        rewards = np.array(rewards)
-        return (rewards - np.mean(rewards)) / (np.std(rewards) + 1e-8)
+        return self.select_local_action_eval(agent, state)
 
-    def store_transition(self, agent, state, action, reward, next_state, done):
-        # reward = self.normalize_reward(reward)
-        if len(self.memory) > self.memory_size:
-            self.memory.pop(0)
-        self.memory.append((agent, state, action, reward, next_state, done))
-
-    def sample_experiences(self):
-        return random.sample(self.memory, min(len(self.memory), self.batch_size))
-
-    def normalize_combined_reward(self, combined_reward, min_combined, max_combined):
+    def _accumulate_multi_step_return(self, rewards):
         """
-        Normalize the combined reward to the range [0, 1].
+        Compute the multi-step return from a list of rewards.
+        Since this is a finite MDP, no discounting is applied.
         """
-        return (combined_reward - min_combined) / (
-                    max_combined - min_combined + 1e-8)  # Add epsilon to avoid division by zero
+        multi_step_return = 0.0
+        for r in rewards:
+            multi_step_return += r
+        return multi_step_return
+    def train_centralized_mc(self,
+                             env,
+                             max_steps: int = 30,
+                             total_episodes: int = 1000,
+                             convergence_window: int = 20):
+        """
+        Fully‐centralized Monte Carlo updates over joint state & joint action.
+        At the end of each episode, computes discounted team‐returns G_t,
+        then does one big gradient step minimizing (Q_joint(s,a) - G_t)^2
+        summed over the whole episode.
+        """
+        self.global_rewards.clear()
+        self.episode_rewards = {a: [] for a in self.agents}
 
-    def update_network(self, agent, global_reward):
-        if len(self.memory) < self.batch_size:
-            return
-
-        # Sample experiences from memory
-        experiences = self.sample_experiences()
-        batch_agent, batch_state, batch_action, batch_reward, batch_next_state, batch_done = zip(*experiences)
-
-        # Convert to tensors
-        batch_state = torch.FloatTensor(np.array(batch_state))
-        batch_action = torch.LongTensor(batch_action).unsqueeze(1)
-        batch_reward = torch.FloatTensor(batch_reward)
-        batch_next_state = torch.FloatTensor(np.array(batch_next_state))
-        batch_done = torch.FloatTensor(batch_done)
-
-        # Get current Q-values from the agent's network
-        current_q_values = self.networks[agent](batch_state).gather(1, batch_action).squeeze()
-
-        # Compute max next Q-values from the target network
-        with torch.no_grad():
-            max_next_q_values = self.target_networks[agent](batch_next_state).max(1)[0]
-
-            # Calculate the combined reward (global * batch reward)
-            combined_reward = (global_reward * batch_reward)
-
-            # Normalize the combined reward to [0, 1]
-            min_combined = combined_reward.min().item()  # Get the minimum combined reward
-            max_combined = combined_reward.max().item()  # Get the maximum combined reward
-            normalized_combined_reward = self.normalize_combined_reward(combined_reward, min_combined, max_combined)
-
-            # Compute target Q-values using the normalized combined reward
-            target_q_values = normalized_combined_reward + (1 - batch_done) * max_next_q_values
-
-            # target_q_values = torch.where(batch_done == 1, combined_reward, target_q_values)
-
-        # Compute the loss between current Q-values and target Q-values
-        loss = nn.MSELoss()(current_q_values, target_q_values)
-
-        # Perform backpropagation and update the network
-        self.optimizers[agent].zero_grad()
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.networks[agent].parameters(), max_norm=1.0)
-        self.optimizers[agent].step()
-
-    def update_target_network(self, agent, tau=0.01):
-        """Soft update the target network parameters using state_dict."""
-        for key in self.networks[agent].state_dict().keys():
-            self.target_networks[agent].state_dict()[key].data.copy_(
-                tau * self.networks[agent].state_dict()[key].data + (1.0 - tau) *
-                self.target_networks[agent].state_dict()[key].data
-            )
-
-    def linear_decay(self, episode, total_episodes):
-        return max(self.min_epsilon, self.epsilon - (self.epsilon - self.min_epsilon) * (episode / total_episodes))
-
-    def exponential_decay(self, episode, decay_rate=0.8):
-        return max(self.min_epsilon, self.epsilon * (1 - decay_rate) ** episode)
-
-    def inverse_time_decay(self, episode, decay_rate=0.8):
-        return max(self.min_epsilon, self.epsilon / (1 + decay_rate * episode))
-
-    def polynomial_decay(self, episode, total_episodes, power=2):
-        return max(self.min_epsilon, self.epsilon * (1 - episode / total_episodes) ** power)
-
-    def cosine_decay(self, episode, total_episodes):
-        return self.min_epsilon + 0.5 * (self.epsilon - self.min_epsilon) * (
-                    1 + np.cos(np.pi * episode / total_episodes))
-
-    def step_decay(self, episode, step_size=10, decay_factor=0.5):
-        return max(self.min_epsilon, self.epsilon * (decay_factor ** (episode // step_size)))
-
-    def sigmoid_decay(self, episode, total_episodes):
-        return self.min_epsilon + (self.epsilon - self.min_epsilon) / (
-                    1 + np.exp(10 * (episode / total_episodes - 0.5)))
-
-    def logarithmic_decay(self, episode, decay_rate=0.01):
-        return max(self.min_epsilon, self.epsilon / (1 + decay_rate * np.log(1 + episode)))
-
-    def hyperbolic_decay(self, episode, decay_rate=0.01):
-        return max(self.min_epsilon, self.epsilon / (1 + decay_rate * episode ** 2))
-
-    def staircase_decay(self, episode, step_size=10, decay_factor=0.5):
-        return max(self.min_epsilon, self.epsilon * (decay_factor ** (episode // step_size)))
-
-    def adaptive_decay(self, episode, reward, threshold=0.1):
-        if reward > threshold:
-            return max(self.min_epsilon, self.epsilon * 0.99)
-        else:
-            return self.epsilon
-    def train(self, env, max_steps=30, update_target_steps=100):
-        total_episodes = 500
-        pbar = tqdm(total=total_episodes, desc="Training Progress", leave=True)
-        for episode in range(total_episodes):
+        for ep in range(1, total_episodes+1):
+            # reset
             states = env.reset()
-            total_rewards = {agent: 0 for agent in self.agents}
-            global_reward = 0
+            ep_reward = 0.0
+            self.transition_buffer.clear()
 
-            for step in range(max_steps):
-                actions = {agent: self.select_action(agent, states[agent]) for agent in self.agents}
-                next_states, rewards, dones, _ = env.step(actions)
+            # decay epsilon
+            self.epsilon = max(self.min_epsilon, self.epsilon * self.epsilon_decay)
+            if self.epsilon <= self.min_epsilon:
+                print(f"[MC Centralized] ε has decayed to floor ({self.epsilon:.4f}) on episode {ep}; stopping.")
+                break
 
-                for agent in self.agents:
-                    action = actions[agent]
-                    reward = rewards[agent]
-                    next_state = next_states[agent]
-                    done = dones[agent]
-                    self.store_transition(agent, states[agent], action, reward, next_state, done)
-                    self.update_network(agent, global_reward)
-                    total_rewards[agent] += reward
+            # 1) run one episode, collect (joint_state, joint_action, team_reward)
+            for t in range(max_steps):
+                js = np.concatenate([states[a] for a in self.agents])
+                # ε-greedy joint action
+                if random.random() < self.epsilon:
+                    joint_act = [random.randrange(self.action_space_size)
+                                 for _ in self.agents]
+                else:
+                    with torch.no_grad():
+                        q_heads = self.network(
+                            torch.FloatTensor(js).unsqueeze(0)
+                        )[0]  # (N_agents, A)
+                        joint_act = [int(q_heads[i].argmax())
+                                     for i in range(self.num_agents)]
 
-                    self.unique_states[agent].add(tuple(states[agent]))
+                next_states, rewards, dones, _ = env.step({
+                    a: joint_act[i] for i, a in enumerate(self.agents)
+                })
+                # team reward
+                r_team = sum(rewards.values())
+                ep_reward += r_team
 
-                global_reward += sum(rewards.values())
+                # store transition
+                self.transition_buffer.append((js, joint_act, r_team))
+
                 states = next_states
                 if all(dones.values()):
                     break
 
+            # 2) compute backward discounted returns G_t
+            returns = []
+            G = 0.0
+            for (_, _, r) in reversed(self.transition_buffer):
+                G = r + self.gamma * G
+                returns.insert(0, G)
+
+            # 3) one gradient step over the whole episode
+            total_loss = 0.0
+            for (js, joint_act, _), G_t in zip(self.transition_buffer, returns):
+                # compute current joint‐Q = sum_i Q_i(js, a_i)
+                q_heads = self.network(
+                    torch.FloatTensor(js).unsqueeze(0)
+                )[0]  # (N_agents, A)
+                q_joint = sum(q_heads[i, joint_act[i]]
+                              for i in range(self.num_agents))
+                # MSE against Monte Carlo target
+                target = torch.tensor(G_t, dtype=q_joint.dtype)
+                total_loss += nn.MSELoss()(q_joint, target)
+
+            # normalize loss
+            total_loss = total_loss / len(self.transition_buffer)
+            self.optimizer.zero_grad()
+            total_loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.network.parameters(), max_norm=1.0)
+            self.optimizer.step()
+
+            # 4) record & sync
+            self.global_rewards.append(ep_reward)
+            for a in self.agents:
+                self.episode_rewards[a].append(ep_reward / self.num_agents)
+
+            self.target_network.load_state_dict(self.network.state_dict())
+
+            # # periodic target‐net sync
+            # if ep % 50 == 0:
+            #     self.target_network.load_state_dict(self.network.state_dict())
+
+            # # convergence check
+            # if len(self.global_rewards) >= convergence_window:
+            #     avg = sum(self.global_rewards[-convergence_window:]) / convergence_window
+            #     thresh = 0.9 * self.num_agents * env.gamma * max_steps
+            #     if avg >= thresh:
+            #         print(f"[MC Centralized] Converged at episode {ep} (avg {avg:.2f})")
+            #         break
+
+        # save learning curve
+        save_path = f"results/avg_rewards_centralized_mc_gamma_{env.gamma}.png"
+        self.plot_rewards(save_path)
+
+    def train_centralized_td(self,
+                          env,
+                          max_steps: int = 30,
+                          total_episodes: int = 1000,
+                          convergence_window: int = 20):
+        """
+        Fully-centralized Q-learning over joint state & joint action.
+        Network is the same CentralizedDQNetwork: N heads → sum into one joint-Q.
+        """
+        self.global_rewards.clear()
+        self.episode_rewards = {a: [] for a in self.agents}
+        for ep in range(1, total_episodes+1):
+            states = env.reset()
+            ep_reward = 0.0
+
+            # decay epsilon
             self.epsilon = max(self.min_epsilon, self.epsilon * self.epsilon_decay)
-            # self.epsilon = self.exponential_decay(episode)
-            # self.epsilon = self.cosine_decay(episode, total_episodes)
-            # self.epsilon = self.inverse_time_decay(episode)
-            # self.epsilon = self.sigmoid_decay(episode, total_episodes)
-            # self.epsilon = self.logarithmic_decay(episode)
-            # self.epsilon = self.hyperbolic_decay(episode)
-            # self.epsilon = self.staircase_decay(episode)
+            if self.epsilon <= self.min_epsilon:
+                print(f"[MC Centralized] ε has decayed to floor ({self.epsilon:.4f}) on episode {ep}; stopping.")
+                break
 
-            # if episode % update_target_steps == 0:
-            for agent in self.agents:
-                self.update_target_network(agent)
+            for t in range(max_steps):
+                # 1) form joint_state and select joint_action ε-greedy
+                js = np.concatenate([states[a] for a in self.agents])
+                if random.random() < self.epsilon:
+                    joint_act = [random.randrange(self.action_space_size)
+                                 for _ in self.agents]
+                else:
+                    with torch.no_grad():
+                        q_heads = self.network(
+                            torch.FloatTensor(js).unsqueeze(0)
+                        )[0]            # shape (N_agents, A)
+                        # greedy per head:
+                        joint_act = [int(q_heads[i].argmax())
+                                     for i in range(self.num_agents)]
 
-            for agent in self.agents:
-                self.episode_rewards[agent].append(total_rewards[agent])
+                # 2) step env
+                next_states, rewards, dones, _ = env.step({
+                    a: joint_act[i] for i, a in enumerate(self.agents)
+                })
+                r_team = sum(rewards.values())
+                ep_reward += r_team
+
+                # 3) compute TD target y
+                #    - current joint Q = sum_i Q_i(s,a_i)
+                q_heads = self.network(
+                    torch.FloatTensor(js).unsqueeze(0)
+                )[0]                 # (N, A)
+                q_joint = sum(q_heads[i, joint_act[i]]
+                              for i in range(self.num_agents))
+
+                #    - next‐state best joint Q
+                js_next = np.concatenate([next_states[a] for a in self.agents])
+                with torch.no_grad():
+                    qn = self.target_network(
+                        torch.FloatTensor(js_next).unsqueeze(0)
+                    )[0]          # (N, A)
+                    # precompute best sum over all per-agent maxes:
+                    best_sum = sum(qn[i].max().item()
+                                   for i in range(self.num_agents))
+
+                y = r_team + self.gamma * best_sum
+
+                # 4) loss & backprop
+                loss = nn.MSELoss()(q_joint, torch.tensor(y))
+                self.optimizer.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.network.parameters(), 1.0)
+                self.optimizer.step()
+
+                states = next_states
+                if all(dones.values()):
+                    break
+
+            # log
+            self.global_rewards.append(ep_reward)
+            for a in self.agents:
+                self.episode_rewards[a].append(ep_reward / self.num_agents)
+            self.target_network.load_state_dict(self.network.state_dict())
+
+            # # target network sync (periodically)
+            # if ep % 50 == 0:
+            #
+            #
+            # # check convergence
+            # if len(self.global_rewards) >= convergence_window:
+            #     avg = sum(self.global_rewards[-convergence_window:]) / convergence_window
+            #     if avg >= 0.9 * env.num_agents * env.gamma * max_steps:
+            #         print(f"Converged at episode {ep}")
+            #         break
+
+        # save learning curve
+        save_path = f"results/avg_rewards_centralized_td_{self.reward_mix_alpha}_gamma_{env.gamma}.png"
+        self.plot_rewards(save_path)
+
+
+    def train_td(self, env, max_steps=30):
+        """
+        Training loop using one‐step TD updates at each env.step(),
+        with early stopping once moving‐average global return ≥ 90% of max.
+        """
+        discount_gamma = 0.99  # no discounting for finite MDPs
+        total_episodes = 1000
+        convergence_window = 20
+
+        # compute convergence threshold
+        max_per_agent_step = self.gamma * env.total_students
+        max_global_episode = len(self.agents) * max_per_agent_step * max_steps
+        target_avg_return = 0.9 * max_global_episode
+
+        convergence_ep = None
+        # pbar = tqdm(total=total_episodes, desc="TD Training", leave=True)
+
+        # reset logs
+        self.global_rewards.clear()
+        self.episode_rewards = {a: [] for a in self.agents}
+
+        for episode in range(1, total_episodes + 1):
+            total_rewards = {agent: 0.0 for agent in self.agents}
+            global_reward = 0.0
+            states = env.reset()
+            # decay ε at start of episode
+            self.epsilon = max(self.min_epsilon, self.epsilon * self.epsilon_decay)
+
+            for step in range(max_steps):
+                # 1) select actions (no reward_mix logic here)
+                joint_state = np.concatenate([states[a] for a in self.agents])
+                actions = {
+                    a: self.select_local_action(a, states[a])
+                    for a in self.agents
+                }
+
+                # 2) step env
+                next_states, rewards, dones, _ = env.step(actions)
+
+                # 3) logging
+                for a in self.agents:
+                    total_rewards[a] += rewards[a]
+                global_reward += sum(rewards.values())
+
+                # 4) build tensors
+                js = torch.FloatTensor(joint_state).unsqueeze(0)  # [1, N·S]
+                next_js = np.concatenate([next_states[a] for a in self.agents])
+                js_next = torch.FloatTensor(next_js).unsqueeze(0)  # [1, N·S]
+                q_all = self.network(js)[0]  # [N, A]
+                q_next_all = self.target_network(js_next)[0]  # [N, A]
+
+                # 5) compute 1‐step TD target
+                q_taken = torch.stack([
+                    q_all[i, actions[a]]
+                    for i, a in enumerate(self.agents)
+                ])  # [N_agents]
+
+                td_targets = []
+                for i, a in enumerate(self.agents):
+                    r = rewards[a]
+                    max_qn = q_next_all[i].max().item()
+                    td_targets.append(r + max_qn)
+                target = torch.tensor(td_targets, dtype=q_taken.dtype)
+
+                # 6) loss & update
+                loss = nn.MSELoss()(q_taken, target)
+                self.optimizer.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.network.parameters(), max_norm=1.0)
+                self.optimizer.step()
+
+                states = next_states
+                if all(dones.values()):
+                    break
+
+            # record episode rewards
+            for a in self.agents:
+                self.episode_rewards[a].append(total_rewards[a])
             self.global_rewards.append(global_reward)
 
-            pbar.update(1)
+            # moving-average check
+            window = min(convergence_window, len(self.global_rewards))
+            avg_r = sum(self.global_rewards[-window:]) / window
+            if avg_r >= target_avg_return:
+                convergence_ep = episode
+                # pbar.close()
+                # print(f"Converged at episode {episode} (avg last {window} = {avg_r:.2f})")
+                break
 
-        pbar.close()
-        rewards_path = f"results/avg_rewards_dqn3_{env.gamma}.png"
-        self.plot_rewards(rewards_path)
+        # save curve
+        td_path = f"results/avg_rewards_TD_gamma_{self.gamma}.png"
+        self.plot_rewards(td_path)
 
+        return convergence_ep
+
+    def train(self, env, max_steps=30):
+        """
+        Training loop: single‐step TD updates at every env.step().
+        """
+        # convergence criteria:
+        total_episodes = 1000
+        max_per_agent_step = self.gamma * env.total_students
+        max_global_episode = 2 * max_per_agent_step * max_steps
+        target_avg_return = 0.9 * max_global_episode
+
+        # pbar = tqdm(total=total_episodes, desc="Training Progress", leave=True)
+        self.global_rewards.clear()
+        self.episode_rewards = {a: [] for a in self.agents}
+
+        convergence_episodes = None
+
+        for episode in range(total_episodes):
+            total_rewards = {agent: 0.0 for agent in self.agents}
+            global_reward = 0.0
+            states = env.reset()
+            self.transition_buffer.clear()
+
+            # 1) run one episode, store transitions
+            for step in range(max_steps):
+                joint_state = np.concatenate([states[a] for a in self.agents])
+                if self.reward_mix_alpha > 0:
+                    acts = self.select_joint_actions(joint_state)
+                    actions = {a: acts[i] for i, a in enumerate(self.agents)}
+                else:
+                    actions = {a: self.select_local_action(a, states[a]) for a in self.agents}
+
+                next_states, rewards, dones, _ = env.step(actions)
+                # accumulate
+                for a in self.agents:
+                    total_rewards[a] += rewards[a]
+                global_reward += sum(rewards.values())
+
+                # buffer: (joint_state, list_of_actions, list_of_rewards)
+                self.transition_buffer.append((
+                    joint_state,
+                    [actions[a] for a in self.agents],
+                    [rewards[a] for a in self.agents]
+                ))
+
+                states = next_states
+                if all(dones.values()):
+                    break
+
+            # 2) compute Monte‐Carlo returns G_t (team‐sum or team‐avg)
+            G = 0.0
+            returns = []
+            # iterate backwards
+            for (_, _, reward_list) in reversed(self.transition_buffer):
+                team_r = sum(reward_list)/self.num_agents # or sum(...) / self.num_agents for average‐team
+                G = team_r  # accumulate returns
+                returns.insert(0, G)
+
+            # 3) one batched gradient step over all t
+            total_loss = 0.0
+            for (joint_state, actions, _), G_t in zip(self.transition_buffer, returns):
+                js = torch.FloatTensor(joint_state).unsqueeze(0)  # [1, N·S]
+                q_all = self.network(js)[0]  # [N_agents, A]
+                # pick each agent’s taken‐action Q
+                q_taken = torch.stack([q_all[i, actions[i]]
+                                       for i in range(self.num_agents)])  # [N_agents]
+                # target: team‐average return
+                G_team = G_t
+                target = torch.full_like(q_taken, G_team)
+                total_loss += nn.MSELoss()(q_taken, target)
+
+            total_loss = total_loss / len(self.transition_buffer)
+            self.optimizer.zero_grad()
+            total_loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.network.parameters(), max_norm=1.0)
+            self.optimizer.step()
+
+            # record and decay ε
+            for a in self.agents:
+                self.episode_rewards[a].append(total_rewards[a])
+            self.global_rewards.append(global_reward)
+            self.epsilon = max(self.min_epsilon, self.epsilon * self.epsilon_decay)
+
+
+            window = min(20, len(self.global_rewards))
+            avg_r = sum(self.global_rewards[-window:]) / window
+
+            if target_avg_return is not None and avg_r >= target_avg_return:
+                convergence_ep = episode
+                # pbar.close()
+                print(f"Converged at episode {episode} (avg over last {window} = {avg_r:.2f})")
+                break
+
+            # pbar.set_description(
+            #     f"Episode {episode+1} | AvgR {avg_r:.2f} | Eps {self.epsilon:.3f}"
+            # )
+            # pbar.update(1)
+
+        # pbar.close()
+        save_path = f"results/avg_rewards_CTDE_mc_{self.reward_mix_alpha}_gamma_{env.gamma}.png"
+        self.plot_rewards(save_path)
+
+
+    def evaluate(self, env, max_steps=52, centralized=False):
+        """
+        Evaluation of the agent's policy.
+        If reward_mix_alpha > 0, uses centralized joint evaluation with greedy joint action selection.
+        Otherwise, decentralized greedy evaluation per agent.
+        """
+        if centralized:
+            return self.evaluate_centralized(env, max_steps)
+        else:
+            states = env.reset()
+            evaluation_data = {'steps': [], 'agents': {}}
+            for agent in self.agents:
+                evaluation_data['agents'][agent] = {
+                    'rewards': [],
+                    'actions': [],
+                    'infected': [],
+                    'allowed_students': [],
+                    'cross_class_infections': []
+                }
+
+            for step in range(max_steps):
+                joint_state = np.concatenate([states[agent] for agent in self.agents])
+
+                if self.reward_mix_alpha == 0:
+                    # Selfish (decentralized) evaluation
+                    actions = {
+                        agent: self.select_local_action_eval(agent, states[agent])
+                        for agent in self.agents
+                    }
+                else:
+                    # Cooperative evaluation using exhaustive joint action search (masking)
+                    with torch.no_grad():
+                        joint_state_tensor = torch.FloatTensor(joint_state).unsqueeze(0)  # shape (1, N * state_dim)
+                        q_values = self.network(joint_state_tensor).squeeze(0)  # shape (N, A)
+
+                        # Generate all possible joint actions (Cartesian product)
+                        from itertools import product
+                        action_space = range(self.action_space_size)
+                        all_joint_actions = list(product(action_space, repeat=self.num_agents))
+
+                        best_total_q = float('-inf')
+                        best_joint_action = None
+
+                        for joint_action in all_joint_actions:
+                            total_q = sum(q_values[i, a] for i, a in enumerate(joint_action))
+                            if total_q > best_total_q:
+                                best_total_q = total_q
+                                best_joint_action = joint_action
+
+                        actions = {
+                            agent: best_joint_action[i]
+                            for i, agent in enumerate(self.agents)
+                        }
+
+                for agent in self.agents:
+                    evaluation_data['agents'][agent]['actions'].append(actions[agent])
+                    agent_index = env.agents.index(agent)
+                    allowed_vals = env.action_levels[agent_index]
+                    evaluation_data['agents'][agent]['allowed_students'].append(allowed_vals[actions[agent]])
+                    evaluation_data['agents'][agent]['infected'].append(states[agent][0])
+
+                next_states, rewards, dones, _ = env.step(actions)
+
+                for agent in self.agents:
+                    evaluation_data['agents'][agent]['rewards'].append(rewards[agent])
+
+                allowed_students_all = [evaluation_data['agents'][ag]['allowed_students'][-1] for ag in self.agents]
+                current_infected_all = [states[ag][0] for ag in self.agents]
+
+                for i, agent in enumerate(self.agents):
+                    cross_class_term = 0.0
+                    for j in range(len(current_infected_all)):
+                        if i != j:
+                            other_allowed = allowed_students_all[j]
+                            other_infected = current_infected_all[j]
+                            if other_allowed > 0:
+                                cross_class_term += (other_infected / other_allowed)
+                    if len(self.agents) > 1:
+                        cross_class_term = cross_class_term / (len(self.agents) - 1) * allowed_students_all[i]
+                    else:
+                        cross_class_term = 0.0
+                    evaluation_data['agents'][agent]['cross_class_infections'].append(cross_class_term)
+
+                evaluation_data['steps'].append(step)
+                states = next_states
+
+                if all(dones.values()):
+                    break
+
+            total_rewards = {
+                agent: sum(evaluation_data['agents'][agent]['rewards'])
+                for agent in self.agents
+            }
+            # print("Total rewards per agent:", total_rewards)
+            evaluation_data['total_rewards'] = total_rewards
+            return evaluation_data
+
+    def evaluate_centralized(self, env, max_steps=52):
+        """
+        Fully-centralized evaluation of the joint policy.
+        Always uses greedy joint action selection (i.e. ε=0).
+        Collects the exact same data dict structure as evaluate().
+        """
+        states = env.reset()
+        evaluation_data = {'steps': [], 'agents': {}}
         for agent in self.agents:
-            print(f"Agent {agent} visited {len(self.unique_states[agent])} unique states.")
+            evaluation_data['agents'][agent] = {
+                'rewards': [],
+                'actions': [],
+                'infected': [],
+                'allowed_students': [],
+                'cross_class_infections': []
+            }
 
-    def plot_rewards(self, save_path="results/avg_rewards_dqn.png"):
+        for step in range(max_steps):
+            # 1) form joint_state
+            joint_state = np.concatenate([states[a] for a in self.agents])
+
+            # 2) greedy joint action selection
+            with torch.no_grad():
+                q_heads = self.network(
+                    torch.FloatTensor(joint_state).unsqueeze(0)
+                ).squeeze(0)  # shape (N_agents, A)
+            joint_action = [int(q_heads[i].argmax())
+                            for i in range(self.num_agents)]
+            actions = {agent: joint_action[i]
+                       for i, agent in enumerate(self.agents)}
+
+            # 3) record per-agent pre-step data
+            for agent in self.agents:
+                evaluation_data['agents'][agent]['actions'].append(actions[agent])
+                idx = env.agents.index(agent)
+                lvl = env.action_levels[idx][actions[agent]]
+                evaluation_data['agents'][agent]['allowed_students'].append(lvl)
+                # assume state[0] == infected count
+                evaluation_data['agents'][agent]['infected'].append(states[agent][0])
+
+            # 4) step environment
+            next_states, rewards, dones, _ = env.step(actions)
+
+            # 5) record rewards
+            for agent in self.agents:
+                evaluation_data['agents'][agent]['rewards'].append(rewards[agent])
+
+            # 6) record cross-class infections
+            last_allowed = [evaluation_data['agents'][a]['allowed_students'][-1]
+                            for a in self.agents]
+            current_infected = [states[a][0] for a in self.agents]
+            for i, agent in enumerate(self.agents):
+                term = 0.0
+                for j in range(self.num_agents):
+                    if i != j and last_allowed[j] > 0:
+                        term += (current_infected[j] / last_allowed[j])
+                if self.num_agents > 1:
+                    term = term / (self.num_agents - 1) * last_allowed[i]
+                evaluation_data['agents'][agent]['cross_class_infections'].append(term)
+
+            evaluation_data['steps'].append(step)
+            states = next_states
+            if all(dones.values()):
+                break
+
+        # 7) total rewards
+        evaluation_data['total_rewards'] = {
+            agent: sum(evaluation_data['agents'][agent]['rewards'])
+            for agent in self.agents
+        }
+        return evaluation_data
+
+    def plot_rewards(self, save_path="results/avg_rewards_CTDE.png"):
         plt.figure(figsize=(10, 5))
-
         for agent, rewards in self.episode_rewards.items():
             plt.plot(rewards, label=f"{agent} Rewards")
         plt.plot(self.global_rewards, label="Global Rewards", linestyle='--')
-
         plt.title("Episode Rewards During Training")
         plt.xlabel("Episode")
         plt.ylabel("Total Reward")
         plt.legend()
         plt.grid(True)
-        if not os.path.exists(os.path.dirname(save_path)):
-            os.makedirs(os.path.dirname(save_path))
-        plt.savefig(save_path)
-
-    def evaluate(self, env, max_steps=52):
-        states = env.reset()
-        episode_infected = {agent: [] for agent in self.agents}
-        episode_allowed = {agent: [] for agent in self.agents}
-        episode_community_risk = {agent: [] for agent in self.agents}
-
-        for step in range(max_steps):
-            actions = {agent: self.select_action(agent, states[agent]) for agent in self.agents}
-            next_states, rewards, dones, _ = env.step(actions)
-
-            for agent in self.agents:
-                episode_infected[agent].append(env.student_status[self.agents.index(agent)])
-                episode_allowed[agent].append(env.allowed_students[self.agents.index(agent)])
-                episode_community_risk[agent].append(
-                    env.shared_community_risk[min(env.current_week, env.max_weeks - 1)])
-            states = next_states
-            if all(dones.values()):
-                break
-
-        self.plot_infected_allowed_and_risk_over_time(episode_infected, episode_allowed, episode_community_risk,
-                                                      save_path="results/infected_allowed_and_risk_over_time_evaluation.png")
-
-    def plot_infected_allowed_and_risk_over_time(self, infected_over_time, allowed_over_time, community_risk_over_time,
-                                                 save_path="results/infected_allowed_and_risk_over_time.png"):
-        num_agents = len(infected_over_time)
-        fig, axes = plt.subplots(num_agents, 1, figsize=(10, 5 * num_agents), sharex=True)
-
-        if num_agents == 1:
-            axes = [axes]
-
-        for i, agent in enumerate(infected_over_time):
-            ax = axes[i]
-            ax.bar(range(len(allowed_over_time[agent])), allowed_over_time[agent], alpha=0.6,
-                   label=f"{agent} Allowed Over Time")
-            ax.plot(infected_over_time[agent], color='r', label=f"{agent} Infected Over Time")
-            ax.set_title(f"{agent} - Number of Infected, Allowed Students, and Community Risk Over Time")
-            ax.set_xlabel("Step")
-            ax.set_ylabel("Number of Students")
-            ax.legend(loc='upper left')
-            ax.grid(True)
-
-            ax2 = ax.twinx()
-            ax2.plot(community_risk_over_time[agent], color='g', linestyle='--',
-                     label=f"{agent} Community Risk Over Time")
-            ax2.set_ylabel("Community Risk")
-            ax2.legend(loc='upper right')
-
-        plt.tight_layout()
         if not os.path.exists(os.path.dirname(save_path)):
             os.makedirs(os.path.dirname(save_path))
         plt.savefig(save_path)
