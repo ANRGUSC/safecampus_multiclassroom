@@ -14,7 +14,7 @@ class MyopicAgent:
         self.delta = 0.3  # Cross-classroom transmission rate per shared student
 
         # Define the fraction of shared students between classes
-        self.shared_student_fraction = 0.3  # 20% of students are shared between classes
+        self.shared_student_fraction = 0.5  # 20% of students are shared between classes
 
         self.episode_rewards = {agent: [] for agent in agents}
 

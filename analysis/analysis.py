@@ -5,17 +5,26 @@ import numpy as np
 # Define CSV file locations
 agents_files = {
     "Myopic": {
-        "global_means": "myopic_global_means.csv",
-        "infected_allowed": "myopic_infected_allowed.csv"
+        "global_means": "myopic_global_summary.csv",
+        "infected_allowed": "myopic_inf_allowed_summary.csv"
     },
-    "DQN-TD": {
+    "CTDE-TD": {
         "global_means": "td_dqn_global_summary.csv",
         "infected_allowed": "td_dqn_inf_allowed_summary.csv"
     },
-    "DQN-MC": {
+    "CTDE-MC": {
         "global_means": "mc_dqn_global_summary.csv",
         "infected_allowed": "mc_dqn_inf_allowed_summary.csv"
+    },
+    "Centralized-MC": {
+        "global_means": "mc_centralized_global_summary.csv",
+        "infected_allowed": "mc_centralized_inf_allowed_summary.csv"
+    },
+    "Centralized-TD": {
+        "global_means": "td_centralized_global_summary.csv",
+        "infected_allowed": "td_centralized_inf_allowed_summary.csv"
     }
+
 }
 
 # Read, merge, tag, and aggregate
@@ -37,7 +46,7 @@ combined = combined.groupby(["gamma", "agent"], as_index=False).agg({
     "infected": "mean",
     "allowed": "mean"
 })
-combined.to_csv("combined_summary_100_3_2_03.csv", index=False)
+combined.to_csv("combined_summary_100_3_2_05.csv", index=False)
 
 # Plot 1: Global Mean per Agent by Gamma
 pivot_gm = combined.pivot(index="gamma", columns="agent", values="global_mean")
