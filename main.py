@@ -16,6 +16,9 @@ np.random.seed(SEED)
 torch.manual_seed(SEED)
 
 def run_experiment_centralized(
+    learning_rate,
+    hidden_dim,
+    hidden_layers,
     total_students,
     num_classrooms,
     action_levels,
@@ -67,6 +70,9 @@ def run_experiment_centralized(
                 reward_mix_alpha=alpha,
                 gamma=gamma,
                 seed=SEED,
+                learning_rate=learning_rate,
+                hidden_dim=hidden_dim,
+                hidden_layers=hidden_layers,
                 use_ctde=True
             )
 
@@ -88,9 +94,10 @@ def run_experiment_centralized(
             # 3) visualize
             vis_path = os.path.join(
                 out_dir,
-                f"centr_{method}_policy_γ{gamma:.2f}_α{alpha:.2f}_{timestamp}.png"
+                f"centr_{method}_policy_γ{gamma:.2f}.png"
             )
             visualize_all_states_centralized(
+                method,
                 agents,
                 env,
                 agent,
@@ -265,6 +272,10 @@ def run_myopic_experiment(
     print(f"Myopic summaries and visuals saved in {out_dir}/")
 
 def run_dqn_experiment(
+    learning_rate,
+    hidden_dim,
+    hidden_layers,
+    method,
     total_students,
     num_classrooms,
     action_levels,
@@ -310,7 +321,8 @@ def run_dqn_experiment(
             state_dim = env.observation_spaces[agents[0]].shape[0]
             act_n     = env.action_spaces[agents[0]].n
             agent = DQNAgent(agents, state_dim, act_n,
-                             reward_mix_alpha=alpha, gamma=gamma, seed=SEED)
+                             reward_mix_alpha=alpha, seed=SEED, learning_rate=learning_rate,
+                             hidden_dim=hidden_dim, hidden_layers=hidden_layers)
 
             t0 = time.time()
             agent.train(env, max_steps=max_steps)
@@ -323,11 +335,13 @@ def run_dqn_experiment(
             })
 
             # 2) Visualize learned policy
-            vis_path = os.path.join(out_dir, f"dqn_policy_γ{gamma}_α{alpha}_{timestamp}.png")
+            vis_path = os.path.join(out_dir, f"{method}_dqn_policy_{gamma}.png")
             visualize_all_states_dqn(
+                method,
                 agents,
                 env,
                 agent,
+                gamma=gamma,
                 save_path=vis_path,
                 grid_size=100
             )
@@ -377,9 +391,9 @@ def run_dqn_experiment(
             })
 
     # 5) Save summaries
-    pd.DataFrame(global_rows).to_csv(os.path.join(out_dir, "dqn_global_summary.csv"), index=False)
-    pd.DataFrame(ia_rows).    to_csv(os.path.join(out_dir, "dqn_inf_allowed_summary.csv"), index=False)
-    pd.DataFrame(time_rows).  to_csv(os.path.join(out_dir, "dqn_time_summary.csv"), index=False)
+    pd.DataFrame(global_rows).to_csv(os.path.join(out_dir, f"{method}_dqn_global_summary.csv"), index=False)
+    pd.DataFrame(ia_rows).    to_csv(os.path.join(out_dir, f"{method}_dqn_inf_allowed_summary.csv"), index=False)
+    pd.DataFrame(time_rows).  to_csv(os.path.join(out_dir, f"{method}_dqn_time_summary.csv"), index=False)
 
     print(f"Saved summaries and visuals in {out_dir}/")
 
@@ -399,15 +413,15 @@ def make_env(seed, gamma, total_students, num_classrooms, max_steps, action_leve
 def objective(trial):
     # 1) sample hyperparameters
     lr  = trial.suggest_loguniform("learning_rate", 0.001, 0.1)
-    hd  = trial.suggest_categorical("hidden_dim",   [32, 64])
+    hd  = trial.suggest_categorical("hidden_dim",   [32, 16])
     hl  = trial.suggest_int("hidden_layers", 1, 2)
 
     # fixed experiment settings
     total_students     = 100
     num_classrooms     = 2
     state_dim          = 2
-    action_space_size  = 5
-    action_levels      = 5
+    action_space_size  = 3
+    action_levels      = 3
     gamma_values       = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6]
     eval_seeds         = [0,1,2]   # fewer seeds for speed
     max_steps          = 73
@@ -429,7 +443,7 @@ def objective(trial):
             seed=train_seed
         )
         env_train = make_env(train_seed, gamma, total_students, num_classrooms, max_steps, action_levels)
-        agent.train_centralized_mc(env_train, max_steps=max_steps)
+        agent.train_td(env_train, max_steps=max_steps)
 
         # evaluate over seeds
         for seed in eval_seeds:
@@ -452,57 +466,83 @@ def dqn_hyperparameter_tuning():
 
     # save to CSV
     df = pd.DataFrame([best_params])
-    df.to_csv("exp2_centralized_mc_hyperparameters.csv", index=False)
+    df.to_csv("exp5_centralized_td_hyperparameters.csv", index=False)
     print("Saved best hyperparams to best_dqn_hyperparameters.csv")
 
 if __name__=="__main__":
-    # run_myopic_experiment(
-    #     total_students=100,
-    #     num_classrooms=3,
-    #     action_levels=3,
-    #     alphas=[1.0],
-    #     gamma_values=[0.1, 0.2, 0.3, 0.4, 0.5, 0.6],
-    #     num_seeds=10,
-    #     max_steps=73,
-    #     out_dir="./results/myopic"
-    # )
+    run_myopic_experiment(
+        total_students=100,
+        num_classrooms=2,
+        action_levels=5,
+        alphas=[1.0],
+        gamma_values=[0.1, 0.2, 0.3, 0.4, 0.5, 0.6],
+        num_seeds=10,
+        max_steps=73,
+        out_dir="./results/myopic"
+    )
 
-    dqn_hyperparameter_tuning()
+    # dqn_hyperparameter_tuning()
 
-    # run_dqn_experiment(
-    #     total_students=100,
-    #     num_classrooms=2,
-    #     action_levels=3,
-    #     gamma_values=[0.1, 0.2, 0.3],
-    #     alphas=[0.0, 0.5, 1.0],
-    #     num_seeds=10,
-    #     max_steps=73,
-    #     out_dir="./results/dqn"
-    # )
 
-    # # centralized Monte Carlo
-    # run_experiment_centralized(
-    #     total_students=100,
-    #     num_classrooms=2,
-    #     action_levels=3,
-    #     gamma_values=[0.1, 0.2, 0.3],
-    #     alphas=[0.0, 0.5, 1.0],
-    #     method="mc",
-    #     num_seeds=10,
-    #     max_steps=73,
-    #     out_dir="./results/centralized_mc"
-    # )
-    #
-    # # centralized TD
-    # run_experiment_centralized(
-    #     total_students=100,
-    #     num_classrooms=2,
-    #     action_levels=3,
-    #     gamma_values=[0.1, 0.2, 0.3],
-    #     alphas=[0.0, 0.5, 1.0],
-    #     method="td",
-    #     num_seeds=10,
-    #     max_steps=73,
-    #     out_dir="./results/centralized_td"
-    # )
+
+    run_dqn_experiment(
+        learning_rate=0.00482,
+        hidden_dim=16,
+        hidden_layers=1,
+        method="td",
+        total_students=100,
+        num_classrooms=2,
+        action_levels=5,
+        gamma_values=[0.1, 0.2, 0.3, 0.4, 0.5, 0.6],
+        alphas=[1.0],
+        num_seeds=10,
+        max_steps=73,
+        out_dir="./results"
+    )
+
+    run_dqn_experiment(
+        learning_rate=0.002,
+        hidden_dim=16,
+        hidden_layers=2,
+        method="mc",
+        total_students=100,
+        num_classrooms=2,
+        action_levels=5,
+        gamma_values=[0.1, 0.2, 0.3, 0.4, 0.5, 0.6],
+        alphas=[1.0],
+        num_seeds=10,
+        max_steps=73,
+        out_dir="./results"
+    )
+    # centralized Monte Carlo
+    run_experiment_centralized(
+        learning_rate=0.0272,
+        hidden_dim=16,
+        hidden_layers=1,
+        total_students=100,
+        num_classrooms=2,
+        action_levels=5,
+        gamma_values=[0.1, 0.2, 0.3, 0.4, 0.5, 0.6],
+        alphas=[1.0],
+        method="mc",
+        num_seeds=10,
+        max_steps=73,
+        out_dir="./results/centralized_mc"
+    )
+
+    # centralized TD
+    run_experiment_centralized(
+        learning_rate=0.001,
+        hidden_dim=32,
+        hidden_layers=1,
+        total_students=50,
+        num_classrooms=2,
+        action_levels=5,
+        gamma_values=[0.1, 0.2, 0.3, 0.4, 0.5, 0.6],
+        alphas=[1.0],
+        method="td",
+        num_seeds=10,
+        max_steps=73,
+        out_dir="./results/centralized_td"
+    )
 

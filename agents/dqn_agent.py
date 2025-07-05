@@ -43,7 +43,7 @@ class CentralizedDQNetwork(nn.Module):
 # --------------------- CTDE DQNAgent with Multi-Step TD Returns and Penalty ---------------------
 class DQNAgent:
     def __init__(self, agents, state_dim, action_space_size, reward_mix_alpha=0.5,
-                 learning_rate=0.002, epsilon=1.0, epsilon_decay=0.995, min_epsilon=0.0001,
+                 learning_rate=0.03, epsilon=1.0, epsilon_decay=0.995, min_epsilon=0.0001,
                  gamma=0.99, use_ctde=True, n_step=2, seed=None, hidden_dim=32, hidden_layers=3):
         """
         CTDE: Centralized Training with Decentralized Execution.
@@ -533,7 +533,7 @@ class DQNAgent:
             # pbar.update(1)
 
         # pbar.close()
-        save_path = f"results/avg_rewards_CTDE_mc_{self.reward_mix_alpha}_gamma_{env.gamma}.png"
+        save_path = f"results/avg_rewards_CTDE_mc_gamma_{env.gamma}.png"
         self.plot_rewards(save_path)
 
 
@@ -719,3 +719,4 @@ class DQNAgent:
         if not os.path.exists(os.path.dirname(save_path)):
             os.makedirs(os.path.dirname(save_path))
         plt.savefig(save_path)
+        plt.close()

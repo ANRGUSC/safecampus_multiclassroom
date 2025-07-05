@@ -99,6 +99,7 @@ def visualize_tabular(
 
 
 def visualize_all_states_dqn(
+    method,
     agents,
     env,
     dqn_agent,
@@ -215,7 +216,7 @@ def visualize_all_states_dqn(
 
     # 9) Title & layout
     # title per gamma value
-    fig.suptitle(f"MC-CTDE Policy Map (γ={gamma:.2f})", fontsize=16)
+    fig.suptitle(f"{method}-CTDE Policy Map (γ={gamma:.2f})", fontsize=16)
     plt.tight_layout(rect=[0, 0.15, 1, 0.95])
 
     # 10) Save and close
@@ -227,6 +228,7 @@ def visualize_all_states_dqn(
     return save_path
 
 def visualize_all_states_centralized(
+    method,
     agents,
     env,
     agent,                  # your DQNAgent with a CentralizedDQNetwork
@@ -317,7 +319,7 @@ def visualize_all_states_centralized(
                title="Color → action", frameon=False)
 
     # Title with gamma
-    fig.suptitle(f"Centralized Q‐Policy Marginals (γ = {gamma:.2f})", fontsize=16)
+    fig.suptitle(f"{method}-Centralized Q‐Policy Marginals (γ = {gamma:.2f})", fontsize=16)
 
     plt.tight_layout(rect=[0,0.15,1,0.95])
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
