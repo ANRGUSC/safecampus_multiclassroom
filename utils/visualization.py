@@ -216,7 +216,7 @@ def visualize_all_states_dqn(
 
     # 9) Title & layout
     # title per gamma value
-    fig.suptitle(f"{method}-CTDE Policy Map (γ={gamma:.2f})", fontsize=16)
+    fig.suptitle(f"{method}-CTDE Policy Map (w={gamma:.2f})", fontsize=16)
     plt.tight_layout(rect=[0, 0.15, 1, 0.95])
 
     # 10) Save and close
