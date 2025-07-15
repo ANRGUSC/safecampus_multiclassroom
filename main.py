@@ -4,6 +4,7 @@ from agents.myopic_agent import MyopicAgent
 from utils.visualization import visualize_all_states_dqn,visualize_myopic_policy, visualize_all_states_centralized
 import numpy as np
 import os
+import psutil
 import pandas as pd
 import time
 from datetime import datetime
@@ -325,7 +326,7 @@ def run_ctde_experiment(
                          hidden_dim=hidden_dim, hidden_layers=hidden_layers)
 
         t0 = time.time()
-        agent.train_td_double(env, max_steps=max_steps)
+        agent.train_td_double(env, max_steps=max_steps, save_dir=out_dir)
         train_time = time.time() - t0
         time_rows.append({
             "gamma": gamma,
@@ -414,15 +415,15 @@ def make_env(seed, gamma, total_students, num_classrooms, max_steps, action_leve
 
 def objective_per_gamma(trial, gamma, num_eval_seeds=3):
     # 1) sample hyperparams
-    lr = trial.suggest_categorical("learning_rate", [1e-4,1e-3, 1e-2, 1e-1])
-    hd = trial.suggest_categorical("hidden_dim",      [64, 128])
-    hl = trial.suggest_categorical("hidden_layers",   [1, 2, 4, 8])
+    lr = trial.suggest_categorical("learning_rate", [1e-4, 1e-3, 1e-2, 1e-1, 0.2])
+    hd = trial.suggest_categorical("hidden_dim",      [128])
+    hl = trial.suggest_categorical("hidden_layers",   [1, 2])
 
     total_students, num_classrooms = 100, 2
-    max_steps, action_levels = 73, 3
+    max_steps, action_levels       = 73, 3
 
     agents = [f"classroom_{i}" for i in range(num_classrooms)]
-    mean_seed_losses = []
+    all_rewards = []
 
     for seed in range(num_eval_seeds):
         agent = DQNAgent(
@@ -436,29 +437,49 @@ def objective_per_gamma(trial, gamma, num_eval_seeds=3):
             seed=seed
         )
 
-        env_train = make_env(seed, gamma, total_students, num_classrooms, max_steps, action_levels)
-        # ← call the *loss*-returning version
-        loss_hist = agent.train_td_hyper_loss_double(env_train, max_steps=max_steps, return_loss=True)
-        mean_seed_losses.append(np.mean(loss_hist))
+        env_train = make_env(seed, gamma,
+                             total_students, num_classrooms,
+                             max_steps, action_levels)
+        # assume this returns a list of per-episode *global* rewards
+        rewards_hist = agent.train_td_hyper(
+            env_train,
+            max_steps=max_steps,
+            save_dir=None,
+            return_rewards=True
+        )
+        all_rewards.append(rewards_hist)
 
-    # Optuna will *minimize* this returned value
-    return float(np.mean(mean_seed_losses))
+    # flatten across seeds: average reward per episode
+    avg_rewards = np.mean(all_rewards, axis=0)
+
+    # compute linear slope of that curve
+    x = np.arange(len(avg_rewards))
+    slope = np.polyfit(x, avg_rewards, 1)[0]
+
+    # store it for later inspection
+    trial.set_user_attr("reward_slope", float(slope))
+
+    # if slope is negative, heavily penalize
+    if slope < 0:
+        return -1e6
+
+    # otherwise return overall mean reward
+    return float(np.mean(avg_rewards))
+
 
 def dqn_hyperparameter_tuning_per_gamma(gamma_values, num_eval_seeds=1):
     results = []
 
-    # same grid as before
     search_space = {
-        "learning_rate": [1e-4,1e-3, 1e-2, 1e-1],
-        "hidden_dim":      [64, 128],
-        "hidden_layers":   [1, 2, 4, 8]
+        "learning_rate": [1e-4, 1e-3, 1e-2, 1e-1, 0.2],
+        "hidden_dim":      [128],
+        "hidden_layers":   [1]
     }
 
     for gamma in gamma_values:
-        print(f"Tuning (loss) for γ={gamma}")
+        print(f"Tuning (reward + slope filter) for γ={gamma}")
         sampler = GridSampler(search_space)
-        # now minimize instead of maximize
-        study = optuna.create_study(direction="minimize", sampler=sampler)
+        study = optuna.create_study(direction="maximize", sampler=sampler)
 
         n_trials = (
             len(search_space["learning_rate"]) *
@@ -471,25 +492,128 @@ def dqn_hyperparameter_tuning_per_gamma(gamma_values, num_eval_seeds=1):
             show_progress_bar=True
         )
 
-        best = study.best_trial.params
-        best["gamma"] = gamma
-        results.append(best)
-        print(f"→ best for γ={gamma}: {best}")
+        # pick the best trial *among those with positive slope*
+        valid = [t for t in study.trials if t.user_attrs.get("reward_slope", -999) > 0]
+        if valid:
+            best = max(valid, key=lambda t: t.value)
+        else:
+            # fallback if none had positive slope
+            best = study.best_trial
 
-    pd.DataFrame(results).to_csv("best_dqn_hyperparameters_per_gamma.csv", index=False)
-    print("Done: saved best *loss* configs per gamma.")
+        best_params = best.params
+        best_params["gamma"] = gamma
+        best_params["reward_slope"] = best.user_attrs.get("reward_slope")
+        results.append(best_params)
+
+        print(f"→ best for γ={gamma}: lr={best_params['learning_rate']}, "
+              f"hd={best_params['hidden_dim']}, hl={best_params['hidden_layers']}, "
+              f"slope={best_params['reward_slope']:.3f}")
+
+    pd.DataFrame(results).to_csv(
+        "best_dqn_hyperparameters_per_gamma.csv", index=False
+    )
+    print("Done: saved best configs (positive‐slope filtered) per gamma.")
 
 
-if __name__=="__main__":
+# if __name__ == "__main__":
+#     # GPU setup
+#     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+#     print(f"🎮 Using device: {device}")
+#
+#     if torch.cuda.is_available():
+#         print(f"🚀 GPU: {torch.cuda.get_device_name(0)}")
+#         print(f"📊 GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1024 ** 3:.1f}GB")
+#         torch.cuda.empty_cache()
+#     else:
+#         print("⚠️  CUDA not available, using CPU")
+#         # Set CPU affinity to cores 0-7 for DQN (only if using CPU)
+#         try:
+#             current_process = psutil.Process()
+#             current_process.cpu_affinity([0, 1, 2, 3, 4, 5, 6, 7])
+#             print(f"🧠 DQN training set to use CPU cores 0-7")
+#         except Exception as e:
+#             print(f"⚠️  Could not set CPU affinity: {e}")
+#
+#     # Set process priority to be nice (lower priority)
+#     os.nice(5)
+#
+#     # hyperparameter tuning
+#     # gamma_values = [0.5]
+#     # dqn_hyperparameter_tuning_per_gamma(gamma_values, num_eval_seeds=1)
+#
+#     # # --- 1) Manually enter best hyperparams per gamma ---
+#     best_hyperparams = {
+#         0.5: {"learning_rate": 0.001, "hidden_dim": 128, "hidden_layers": 1},
+#         # 0.7: {"learning_rate": 1e-2, "hidden_dim": 64, "hidden_layers": 8},
+#         # 0.9: {"learning_rate": 1e-3, "hidden_dim": 128, "hidden_layers": 16},
+#         # add more γ: {…} pairs as you like
+#     }
+#
+#     # --- 2) Define your experimental sweep ---
+#     total_students_list = [100]
+#     num_classrooms_list = [2]
+#     action_levels_list = [3]
+#     alphas = [0.0]  # keep fixed or expand
+#     num_seeds = 10
+#     max_steps = 73
+#
+#     # --- 3) Loop over each γ with its own best hyperparams ---
+#     for gamma, hyp in best_hyperparams.items():
+#         lr, hd, hl = hyp["learning_rate"], hyp["hidden_dim"], hyp["hidden_layers"]
+#
+#         for total_students in total_students_list:
+#             for num_classrooms in num_classrooms_list:
+#                 for action_levels in action_levels_list:
+#                     out_dir = (
+#                         f"./results/ctde/"
+#                         f"γ{gamma}_ts{total_students}_nc{num_classrooms}_al{action_levels}"
+#                     )
+#                     os.makedirs(out_dir, exist_ok=True)
+#
+#                     print(
+#                         f"CTDE | γ={gamma} | lr={lr} | hd={hd} | hl={hl} "
+#                         f"| students={total_students} | classes={num_classrooms} "
+#                         f"| levels={action_levels}"
+#                     )
+#
+#                     run_ctde_experiment(
+#                         learning_rate=lr,
+#                         hidden_dim=hd,
+#                         hidden_layers=hl,
+#                         method="ctde",
+#                         total_students=total_students,
+#                         num_classrooms=num_classrooms,
+#                         action_levels=action_levels,
+#                         gamma_values=[gamma],  # only this γ
+#                         alphas=alphas,
+#                         num_seeds=num_seeds,
+#                         max_steps=max_steps,
+#                         out_dir=out_dir
+#                     )
+#
+#     print("✅ All CTDE experiments with manual hyperparams are done.")
+
+if __name__ == "__main__":
+    # Set CPU affinity to cores 0-7 for DQN (leaving 8-15 for multiagent)
+    try:
+        current_process = psutil.Process()
+        current_process.cpu_affinity([0, 1, 2, 3, 4, 5, 6, 7])
+        print(f"🧠 DQN training set to use CPU cores 0-7")
+    except Exception as e:
+        print(f"⚠️  Could not set CPU affinity: {e}")
+
+    # Set process priority to be nice (lower priority)
+    os.nice(5)
+
     # hyperparameter tuning
-    gamma_values = [0.5]
-    dqn_hyperparameter_tuning_per_gamma(gamma_values, num_eval_seeds=1)
+    # gamma_values = [0.5]
+    # dqn_hyperparameter_tuning_per_gamma(gamma_values, num_eval_seeds=1)
 
-    # --- 1) Manually enter best hyperparams per gamma ---
+    # # --- 1) Manually enter best hyperparams per gamma ---
     best_hyperparams = {
-        0.5: {"learning_rate": 1e-3, "hidden_dim": 64, "hidden_layers": 4},
-        0.7: {"learning_rate": 1e-2, "hidden_dim": 64, "hidden_layers": 8},
-        0.9: {"learning_rate": 1e-3, "hidden_dim": 128, "hidden_layers": 16},
+        0.5: {"learning_rate": 0.001, "hidden_dim": 128, "hidden_layers": 1},
+        # 0.7: {"learning_rate": 1e-2, "hidden_dim": 64, "hidden_layers": 8},
+        # 0.9: {"learning_rate": 1e-3, "hidden_dim": 128, "hidden_layers": 16},
         # add more γ: {…} pairs as you like
     }
 
@@ -536,3 +660,4 @@ if __name__=="__main__":
                     )
 
     print("✅ All CTDE experiments with manual hyperparams are done.")
+

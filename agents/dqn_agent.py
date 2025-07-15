@@ -9,6 +9,7 @@ import os
 import math
 
 # --------------------- Centralized Q-Network (Critic) Definition ---------------------
+
 class CentralizedDQNetwork(nn.Module):
     def __init__(self, num_agents, state_dim, action_space_size, hidden_dim=16, hidden_layers=2):
         """
@@ -344,6 +345,100 @@ class DQNAgent:
     import torch
     import torch.nn as nn
     import torch.optim as optim
+    def train_td_double_hyper_rewards(self,
+                                      env,
+                                      max_steps: int = 30,
+                                      save_dir: str = None,
+                                      return_rewards: bool = False):
+        """
+        One‐step TD training with Double‐DQN action selection.
+        If return_rewards=True, returns a list of per‐episode global rewards.
+        Otherwise saves the reward plot into save_dir (or skips saving if save_dir is None).
+        """
+        total_episodes = 1000
+
+        # reset logs
+        self.global_rewards.clear()
+        self.episode_rewards = {a: [] for a in self.agents}
+        reward_history = [] if return_rewards else None
+
+        for episode in range(1, total_episodes + 1):
+            states = env.reset()
+            global_reward = 0.0
+            total_rewards = {a: 0.0 for a in self.agents}
+
+            # decay ε
+            self.epsilon = max(self.min_epsilon, self.epsilon * self.epsilon_decay)
+
+            for step in range(max_steps):
+                # 1) select decentralized actions
+                joint_state = np.concatenate([states[a] for a in self.agents])
+                actions = {a: self.select_local_action(a, states[a])
+                           for a in self.agents}
+
+                # 2) step
+                next_states, rewards, dones, _ = env.step(actions)
+
+                # 3) accumulate rewards
+                for a in self.agents:
+                    total_rewards[a] += rewards[a]
+                global_reward += sum(rewards.values())
+
+                # 4) build tensors
+                js = torch.FloatTensor(joint_state).unsqueeze(0)
+                next_js = torch.FloatTensor(
+                    np.concatenate([next_states[a] for a in self.agents])
+                ).unsqueeze(0)
+
+                # 5) Q‐values
+                q_all = self.network(js)[0]
+                q_next_online = self.network(next_js)[0]
+                q_next_target = self.target_network(next_js)[0].detach()
+
+                # 6) Q(s,a) for taken actions
+                q_taken = torch.stack([
+                    q_all[i, actions[a]] for i, a in enumerate(self.agents)
+                ])
+
+                # 7) Double‐DQN TD targets
+                td_targets = torch.stack([
+                    torch.tensor(rewards[a], dtype=torch.float32)
+                    + self.gamma
+                    * q_next_target[i, q_next_online[i].argmax().item()]
+                    for i, a in enumerate(self.agents)
+                ]).to(q_taken.dtype)
+
+                # 8) loss & backprop
+                loss = nn.MSELoss()(q_taken, td_targets)
+                self.optimizer.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.network.parameters(), max_norm=1.0)
+                self.optimizer.step()
+
+                states = next_states
+                if all(dones.values()):
+                    break
+
+            # record episode rewards
+            for a in self.agents:
+                self.episode_rewards[a].append(total_rewards[a])
+            self.global_rewards.append(global_reward)
+
+            if return_rewards:
+                reward_history.append(global_reward)
+
+        # after training: save plot if requested
+        if not return_rewards and save_dir is not None:
+            os.makedirs(save_dir, exist_ok=True)
+            save_path = os.path.join(
+                save_dir,
+                f"avg_rewards_CTDE_td_gamma_{env.gamma}.png"
+            )
+            self.plot_rewards(save_path)
+
+        # return list of global rewards if asked
+        if return_rewards:
+            return reward_history
 
     def train_td_double(self, env, max_steps=30, save_dir: str = None):
         """
@@ -431,7 +526,7 @@ class DQNAgent:
         save_path = os.path.join(save_dir, f"avg_rewards_CTDE_td_double_gamma_{env.gamma}.png")
         self.plot_rewards(save_path)
 
-    def train_td(self, env, max_steps=30):
+    def train_td(self, env, max_steps=30, save_dir: str = None):
         """
         Training loop using one‐step TD updates at each env.step(),
         with early stopping once moving‐average global return ≥ 90% of max.
@@ -511,9 +606,9 @@ class DQNAgent:
                 self.episode_rewards[a].append(total_rewards[a])
             self.global_rewards.append(global_reward)
 
-        # save curve
-        td_path = f"results/ctde_td_100_default/avg_rewards_CTDE_td_gamma_{env.gamma}.png"
-        self.plot_rewards(td_path)
+        os.makedirs(save_dir, exist_ok=True)
+        save_path = os.path.join(save_dir, f"avg_rewards_CTDE_td_gamma_{env.gamma}.png")
+        self.plot_rewards(save_path)
     #
     def train_mc(self, env, max_steps=30):
         """
@@ -699,7 +794,7 @@ class DQNAgent:
         if return_loss:
             return loss_history
 
-    def train_td_hyper(self, env, max_steps=30, return_rewards=False):
+    def train_td_hyper(self, env, max_steps=30, return_rewards=False, save_dir=None):
         """
         One-step TD training for hyperparameter tuning.
         If return_rewards=True, returns a list of per-episode global rewards.
