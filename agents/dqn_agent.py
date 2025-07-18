@@ -341,10 +341,88 @@ class DQNAgent:
     #     # self.plot_rewards(save_path)
     #
     #
-    import numpy as np
-    import torch
-    import torch.nn as nn
-    import torch.optim as optim
+    def train_td_hyper(self, env, max_steps=30, save_dir: str = None, return_rewards: bool = False):
+        """
+        Training loop using one‐step TD updates at each env.step(),
+        with early stopping once moving‐average global return ≥ 90% of max.
+        """
+        total_episodes = 1000
+
+        # compute convergence threshold
+        max_per_agent_step = self.gamma * env.total_students
+        max_global_episode = len(self.agents) * max_per_agent_step * max_steps
+
+
+        # reset logs
+        self.global_rewards.clear()
+        self.episode_rewards = {a: [] for a in self.agents}
+        reward_history = [] if return_rewards else None
+
+        for episode in range(1, total_episodes + 1):
+            total_rewards = {agent: 0.0 for agent in self.agents}
+            global_reward = 0.0
+            states = env.reset()
+            # decay ε at start of episode
+            self.epsilon = max(self.min_epsilon, self.epsilon * self.epsilon_decay)
+
+            for step in range(max_steps):
+                # 1) select actions (no reward_mix logic here)
+                joint_state = np.concatenate([states[a] for a in self.agents])
+                actions = {
+                    a: self.select_local_action(a, states[a])
+                    for a in self.agents
+                }
+
+                # 2) step env
+                next_states, rewards, dones, _ = env.step(actions)
+
+                # 3) logging
+                for a in self.agents:
+                    total_rewards[a] += rewards[a]
+                global_reward += sum(rewards.values())
+
+                # 4) build tensors
+                js = torch.FloatTensor(joint_state).unsqueeze(0)  # [1, N·S]
+                next_js = np.concatenate([next_states[a] for a in self.agents])
+                js_next = torch.FloatTensor(next_js).unsqueeze(0)  # [1, N·S]
+                q_all = self.network(js)[0]  # [N, A]
+                q_next_all = self.target_network(js_next)[0]  # [N, A]
+
+                # 5) compute 1‐step TD target
+                q_taken = torch.stack([
+                    q_all[i, actions[a]]
+                    for i, a in enumerate(self.agents)
+                ])  # [N_agents]
+
+                td_targets = []
+                for i, a in enumerate(self.agents):
+                    r = rewards[a]
+                    max_qn = q_next_all[i].max().item()
+                    td_targets.append(r + max_qn)
+                target = torch.tensor(td_targets, dtype=q_taken.dtype)
+
+                # 6) loss & update
+                loss = nn.MSELoss()(q_taken, target)
+                self.optimizer.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.network.parameters(), max_norm=1.0)
+                self.optimizer.step()
+
+                states = next_states
+                if all(dones.values()):
+                    break
+
+            # record episode rewards
+            for a in self.agents:
+                self.episode_rewards[a].append(total_rewards[a])
+            self.global_rewards.append(global_reward)
+
+            if return_rewards:
+                reward_history.append(global_reward)
+        # return list of global rewards if asked
+        if return_rewards:
+            return reward_history
+
     def train_td_double_hyper_rewards(self,
                                       env,
                                       max_steps: int = 30,
@@ -427,18 +505,89 @@ class DQNAgent:
             if return_rewards:
                 reward_history.append(global_reward)
 
-        # after training: save plot if requested
-        if not return_rewards and save_dir is not None:
-            os.makedirs(save_dir, exist_ok=True)
-            save_path = os.path.join(
-                save_dir,
-                f"avg_rewards_CTDE_td_gamma_{env.gamma}.png"
-            )
-            self.plot_rewards(save_path)
-
         # return list of global rewards if asked
         if return_rewards:
             return reward_history
+
+    def train_td_double_hyper_loss(self,
+                                      env,
+                                      max_steps: int = 30,
+                                      save_dir: str = None,
+                                      return_loss: bool = False):
+        """
+        One‐step TD training with Double‐DQN action selection.
+        If return_loss=True, returns a list of per‐episode global loss.
+        Otherwise saves the reward plot into save_dir (or skips saving if save_dir is None).
+        """
+        total_episodes = 1000
+
+        # reset logs
+        self.global_rewards.clear()
+        self.episode_rewards = {a: [] for a in self.agents}
+        loss_history = [] if return_loss else None
+
+        for episode in range(1, total_episodes + 1):
+            states = env.reset()
+            total_rewards = {a: 0.0 for a in self.agents}
+            episode_loss = 0.0
+            loss_steps = 0
+
+            # decay ε
+            self.epsilon = max(self.min_epsilon, self.epsilon * self.epsilon_decay)
+
+            for step in range(max_steps):
+                joint_state = np.concatenate([states[a] for a in self.agents])
+                actions = {a: self.select_local_action(a, states[a])
+                           for a in self.agents}
+
+                next_states, rewards, dones, _ = env.step(actions)
+
+                for a in self.agents:
+                    total_rewards[a] += rewards[a]
+
+                js = torch.FloatTensor(joint_state).unsqueeze(0)
+                next_js = torch.FloatTensor(
+                    np.concatenate([next_states[a] for a in self.agents])
+                ).unsqueeze(0)
+
+                q_all = self.network(js)[0]
+                q_next_online = self.network(next_js)[0]
+                q_next_target = self.target_network(next_js)[0].detach()
+
+                q_taken = torch.stack([
+                    q_all[i, actions[a]] for i, a in enumerate(self.agents)
+                ])
+
+                td_targets = torch.stack([
+                    torch.tensor(rewards[a], dtype=torch.float32)
+                    + self.gamma * q_next_target[i, q_next_online[i].argmax().item()]
+                    for i, a in enumerate(self.agents)
+                ]).to(q_taken.dtype)
+
+                loss = nn.MSELoss()(q_taken, td_targets)
+                self.optimizer.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.network.parameters(), max_norm=1.0)
+                self.optimizer.step()
+
+                episode_loss += loss.item()
+                loss_steps += 1
+
+                states = next_states
+                if all(dones.values()):
+                    break
+
+            # record average loss for the episode
+            if return_loss:
+                avg_loss = episode_loss / max(loss_steps, 1)
+                loss_history.append(avg_loss)
+
+            for a in self.agents:
+                self.episode_rewards[a].append(total_rewards[a])
+            self.global_rewards.append(sum(total_rewards.values()))
+
+        if return_loss:
+            return loss_history
 
     def train_td_double(self, env, max_steps=30, save_dir: str = None):
         """
@@ -543,6 +692,7 @@ class DQNAgent:
         convergence_ep = None
         # pbar = tqdm(total=total_episodes, desc="TD Training", leave=True)
 
+
         # reset logs
         self.global_rewards.clear()
         self.episode_rewards = {a: [] for a in self.agents}
@@ -610,7 +760,7 @@ class DQNAgent:
         save_path = os.path.join(save_dir, f"avg_rewards_CTDE_td_gamma_{env.gamma}.png")
         self.plot_rewards(save_path)
     #
-    def train_mc(self, env, max_steps=30):
+    def train_mc(self, env, max_steps=30, save_dir: str = None):
         """
         Training loop: single‐step TD updates at every env.step().
         """
@@ -693,24 +843,11 @@ class DQNAgent:
             self.epsilon = max(self.min_epsilon, self.epsilon * self.epsilon_decay)
 
 
-            window = min(20, len(self.global_rewards))
-            avg_r = sum(self.global_rewards[-window:]) / window
-
-            if target_avg_return is not None and avg_r >= target_avg_return:
-                convergence_ep = episode
-                # pbar.close()
-                print(f"Converged at episode {episode} (avg over last {window} = {avg_r:.2f})")
-                break
-
-            # pbar.set_description(
-            #     f"Episode {episode+1} | AvgR {avg_r:.2f} | Eps {self.epsilon:.3f}"
-            # )
-            # pbar.update(1)
-
-        # pbar.close()
-        save_path = f"./results/ctde_mc_100_default/avg_rewards_CTDE_mc_gamma_{env.gamma}.png"
+        # save the learning curve exactly as before
+        os.makedirs(save_dir, exist_ok=True)
+        save_path = os.path.join(save_dir, f"avg_rewards_CTDE_mc_gamma_{env.gamma}.png")
         self.plot_rewards(save_path)
-    def train_mc_hyper(self, env, max_steps=30, return_loss=False):
+    def train_mc_hyper(self, env, max_steps=30, save_dir: str = None, return_loss=False):
         """
         Training loop: single-step TD updates at every env.step().
         If return_loss=True, returns a list of per-episode losses.
@@ -794,16 +931,18 @@ class DQNAgent:
         if return_loss:
             return loss_history
 
-    def train_td_hyper(self, env, max_steps=30, return_rewards=False, save_dir=None):
+    def train_mc_hyper_rewards(self, env, max_steps=30, save_dir: str = None, return_rewards: bool = False):
         """
-        One-step TD training for hyperparameter tuning.
-        If return_rewards=True, returns a list of per-episode global rewards.
+        Training loop using Monte Carlo updates over episodes,
+        with reward tracking and optional return of reward history.
         """
         total_episodes = 1000
+
+        # compute convergence threshold
         max_per_agent_step = self.gamma * env.total_students
         max_global_episode = len(self.agents) * max_per_agent_step * max_steps
-        target_avg_return = 0.9 * max_global_episode
 
+        # reset logs
         self.global_rewards.clear()
         self.episode_rewards = {a: [] for a in self.agents}
         reward_history = [] if return_rewards else None
@@ -812,37 +951,123 @@ class DQNAgent:
             total_rewards = {agent: 0.0 for agent in self.agents}
             global_reward = 0.0
             states = env.reset()
+
+            # decay epsilon at start of episode
             self.epsilon = max(self.min_epsilon, self.epsilon * self.epsilon_decay)
 
+            self.transition_buffer.clear()
+
+            # collect episode transitions
             for step in range(max_steps):
-                # select & step
                 joint_state = np.concatenate([states[a] for a in self.agents])
-                actions = {a: self.select_local_action(a, states[a]) for a in self.agents}
+                # Select actions (no reward_mix_alpha logic here)
+                actions = {
+                    a: self.select_local_action(a, states[a])
+                    for a in self.agents
+                }
+
                 next_states, rewards, dones, _ = env.step(actions)
 
-                # accumulate
+                # accumulate rewards
                 for a in self.agents:
                     total_rewards[a] += rewards[a]
                 global_reward += sum(rewards.values())
 
-                # TD update (omitted here—assume your fixed version)
-                # ...
+                self.transition_buffer.append(
+                    (joint_state,
+                     [actions[a] for a in self.agents],
+                     [rewards[a] for a in self.agents])
+                )
 
                 states = next_states
                 if all(dones.values()):
                     break
 
-            # record
+            # compute Monte Carlo returns (team-average)
+            G = 0.0
+            returns = []
+            for (_, _, reward_list) in reversed(self.transition_buffer):
+                team_r = sum(reward_list) / self.num_agents
+                G = team_r
+                returns.insert(0, G)
+
+            # one gradient step over whole episode
+            total_loss = 0.0
+            for (joint_state, actions, _), G_t in zip(self.transition_buffer, returns):
+                js = torch.FloatTensor(joint_state).unsqueeze(0)
+                q_all = self.network(js)[0]
+                q_taken = torch.stack([
+                    q_all[i, actions[i]] for i in range(self.num_agents)
+                ])
+                target = torch.full_like(q_taken, G_t)
+                total_loss += nn.MSELoss()(q_taken, target)
+
+            total_loss = total_loss / len(self.transition_buffer)
+            self.optimizer.zero_grad()
+            total_loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.network.parameters(), max_norm=1.0)
+            self.optimizer.step()
+
+            # logging episode rewards
             for a in self.agents:
                 self.episode_rewards[a].append(total_rewards[a])
             self.global_rewards.append(global_reward)
+
             if return_rewards:
                 reward_history.append(global_reward)
-            # update target
-            self.target_network.load_state_dict(self.network.state_dict())
 
         if return_rewards:
             return reward_history
+
+    # def train_td_hyper(self, env, max_steps=30, return_rewards=False, save_dir=None):
+    #     """
+    #     One-step TD training for hyperparameter tuning.
+    #     If return_rewards=True, returns a list of per-episode global rewards.
+    #     """
+    #     total_episodes = 1000
+    #     max_per_agent_step = self.gamma * env.total_students
+    #     max_global_episode = len(self.agents) * max_per_agent_step * max_steps
+    #     target_avg_return = 0.9 * max_global_episode
+    #
+    #     self.global_rewards.clear()
+    #     self.episode_rewards = {a: [] for a in self.agents}
+    #     reward_history = [] if return_rewards else None
+    #
+    #     for episode in range(1, total_episodes + 1):
+    #         total_rewards = {agent: 0.0 for agent in self.agents}
+    #         global_reward = 0.0
+    #         states = env.reset()
+    #         self.epsilon = max(self.min_epsilon, self.epsilon * self.epsilon_decay)
+    #
+    #         for step in range(max_steps):
+    #             # select & step
+    #             joint_state = np.concatenate([states[a] for a in self.agents])
+    #             actions = {a: self.select_local_action(a, states[a]) for a in self.agents}
+    #             next_states, rewards, dones, _ = env.step(actions)
+    #
+    #             # accumulate
+    #             for a in self.agents:
+    #                 total_rewards[a] += rewards[a]
+    #             global_reward += sum(rewards.values())
+    #
+    #             # TD update (omitted here—assume your fixed version)
+    #             # ...
+    #
+    #             states = next_states
+    #             if all(dones.values()):
+    #                 break
+    #
+    #         # record
+    #         for a in self.agents:
+    #             self.episode_rewards[a].append(total_rewards[a])
+    #         self.global_rewards.append(global_reward)
+    #         if return_rewards:
+    #             reward_history.append(global_reward)
+    #         # update target
+    #         self.target_network.load_state_dict(self.network.state_dict())
+    #
+    #     if return_rewards:
+    #         return reward_history
 
     def train_td_hyper_loss(self, env, max_steps=30, return_loss=False):
         """
@@ -1008,7 +1233,7 @@ class DQNAgent:
         if return_loss:
             return loss_history
 
-    def train_centralized_mc(self, env,
+    def train_centralized_mc_hyper(self, env,
                              max_steps: int = 30,
                              total_episodes: int = 1000,
                              convergence_window: int = 20,
