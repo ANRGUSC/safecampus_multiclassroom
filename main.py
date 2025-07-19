@@ -80,9 +80,10 @@ def run_experiment_centralized(
             # 2) Training
             t0 = time.time()
             if method == "mc":
-                agent.train_centralized_mc(env, max_steps=max_steps)
+                agent.train_centralized_mc(env, max_steps=max_steps, save_dir=out_dir)
             else:
-                agent.train_centralized_td(env, max_steps=max_steps)
+                agent.train_centralized_td_double(env, max_steps=max_steps,
+                                                  save_dir=out_dir)
             train_time = time.time() - t0
 
             time_rows.append({
@@ -546,9 +547,9 @@ def make_env(seed, gamma, total_students, num_classrooms, max_steps, action_leve
 # Tuning with loss
 def objective_per_gamma(trial, gamma, num_eval_seeds=3, use_loss=False):
     # Sample hyperparameters
-    lr = trial.suggest_categorical("learning_rate", [0.0001, 0.001, 0.01])
-    hd = trial.suggest_categorical("hidden_dim", [64, 128])
-    hl = trial.suggest_categorical("hidden_layers", [1, 2, 3])
+    lr = trial.suggest_categorical("learning_rate", [0.003, 0.001, 0.01, 0.03])
+    hd = trial.suggest_categorical("hidden_dim", [32, 64])
+    hl = trial.suggest_categorical("hidden_layers", [1, 2])
 
     total_students, num_classrooms = 100, 2
     max_steps, action_levels = 73, 3
@@ -574,19 +575,17 @@ def objective_per_gamma(trial, gamma, num_eval_seeds=3, use_loss=False):
 
         if use_loss:
             # Get per-episode loss history
-            loss_hist = agent.train_mc_hyper(
+            loss_hist = agent.train_centralized_td_double_hyper_loss(
                 env_train,
                 max_steps=max_steps,
-                save_dir=None,
                 return_loss=True
             )
             all_vals.append(loss_hist)
         else:
             # Get per-episode reward history
-            reward_hist = agent.train_mc_hyper_rewards(
+            reward_hist = agent.train_centralized_td_double_hyper_rewards(
                 env_train,
                 max_steps=max_steps,
-                save_dir=None,
                 return_rewards=True
             )
             all_vals.append(reward_hist)
@@ -606,9 +605,9 @@ def dqn_hyperparameter_tuning_per_gamma(gamma_values, num_eval_seeds=1, use_loss
     results = []
 
     search_space = {
-        "learning_rate": [0.001, 0.01, 0.1],
-        "hidden_dim": [64, 128],
-        "hidden_layers": [1, 2, 3]
+        "learning_rate": [0.003, 0.001, 0.01, 0.03],
+        "hidden_dim": [32, 64],
+        "hidden_layers": [1, 2]
     }
 
     direction = "minimize" if use_loss else "maximize"
@@ -653,157 +652,84 @@ def dqn_hyperparameter_tuning_per_gamma(gamma_values, num_eval_seeds=1, use_loss
 
         results.append(best_params)
 
-    filename = "best_dqn_hyperparameters_per_gamma.csv"
+    filename = "best_centralized_dqn_hyperparameters_per_gamma.csv"
     pd.DataFrame(results).to_csv(filename, index=False)
     print(f"Done: saved best configs ({'loss' if use_loss else 'reward'}) per gamma to {filename}")
 
 
-if __name__ == "__main__":
-    # Set CPU affinity to cores 0-7 for DQN (leaving 8-15 for multiagent)
-    try:
-        current_process = psutil.Process()
-        current_process.cpu_affinity([0, 1, 2, 3, 4, 5, 6, 7])
-        print(f"🧠 DQN training set to use CPU cores 0-7")
-    except Exception as e:
-        print(f"⚠️  Could not set CPU affinity: {e}")
-
-    # Set process priority to be nice (lower priority)
-    os.nice(5)
-
-    # hyperparameter tuning
-    # gamma_values = [0.4, 0.5, 0.6]
-    # dqn_hyperparameter_tuning_per_gamma(gamma_values, num_eval_seeds=1, use_loss=False)
-
-    # --- 1) Manually enter best hyperparams per gamma ---
-    best_hyperparams = {
-        0.1: {"learning_rate": 0.1, "hidden_dim": 16, "hidden_layers": 2},
-        0.2: {"learning_rate": 0.1, "hidden_dim": 16, "hidden_layers": 2},
-        0.3: {"learning_rate": 0.1, "hidden_dim": 16, "hidden_layers": 2},
-        0.4: {"learning_rate": 0.001, "hidden_dim": 64, "hidden_layers": 2},
-        0.5: {"learning_rate": 0.001, "hidden_dim": 128, "hidden_layers": 1},
-        0.6: {"learning_rate": 0.01, "hidden_dim": 64, "hidden_layers": 3},
-        # add more γ: {…} pairs as you like
-    }
-
-    # --- 2) Define your experimental sweep ---
-    total_students_list = [100]
-    num_classrooms_list = [2]
-    action_levels_list = [3]
-    alphas = [0.0]  # keep fixed or expand
-    num_seeds = 10
-    max_steps = 73
-    gamma_values = list(best_hyperparams.keys())
-    # Shared logs
-
-    # --- 3) Run all CTDE experiments in one unified directory ---
-    for total_students in total_students_list:
-        for num_classrooms in num_classrooms_list:
-            for action_levels in action_levels_list:
-                # Shared output dir for all gammas
-                out_dir = (
-                    f"./results/ctde-mc/"
-                    f"all_gamma_ts{total_students}_nc{num_classrooms}_al{action_levels}"
-                )
-                os.makedirs(out_dir, exist_ok=True)
-
-                print(f"📦 Running CTDE-MC sweep over gamma in one folder: {out_dir}")
-                global_rows = []
-                ia_rows = []
-                time_rows = []
-
-                # Run all gamma values using their respective hyperparameters
-                for gamma in gamma_values:
-                    hyp = best_hyperparams[gamma]
-                    lr, hd, hl = hyp["learning_rate"], hyp["hidden_dim"], hyp["hidden_layers"]
-
-                    print(
-                        f"→ CTDE-MC | γ={gamma} | lr={lr} | hd={hd} | hl={hl} "
-                        f"| students={total_students} | classes={num_classrooms} "
-                        f"| levels={action_levels}"
-                    )
-
-                    global_rows, ia_rows, time_rows = run_ctde_experiment(
-                        learning_rate=lr,
-                        hidden_dim=hd,
-                        hidden_layers=hl,
-                        method="ctde-mc",
-                        total_students=total_students,
-                        num_classrooms=num_classrooms,
-                        action_levels=action_levels,
-                        gamma_values=[gamma],  # run 1 gamma at a time
-                        alphas=alphas,
-                        num_seeds=num_seeds,
-                        max_steps=max_steps,
-                        out_dir=out_dir,
-                        global_rows=global_rows,
-                        ia_rows=ia_rows,
-                        time_rows=time_rows
-                    )
-
-                # Save once after all gammas
-                pd.DataFrame(global_rows).to_csv(os.path.join(out_dir, "ctde_mc_global_summary.csv"), index=False)
-                pd.DataFrame(ia_rows).to_csv(os.path.join(out_dir, "ctde_mc_inf_allowed_summary.csv"), index=False)
-                pd.DataFrame(time_rows).to_csv(os.path.join(out_dir, "ctde_mc_time_summary.csv"), index=False)
-
-    print("✅ All CTDE experiments with manual hyperparams are done.")
-
 # if __name__ == "__main__":
-#     # Set CPU affinity
+#     # Set CPU affinity to cores 0-7 for DQN (leaving 8-15 for multiagent)
 #     try:
 #         current_process = psutil.Process()
 #         current_process.cpu_affinity([0, 1, 2, 3, 4, 5, 6, 7])
 #         print(f"🧠 DQN training set to use CPU cores 0-7")
 #     except Exception as e:
-#         print(f"⚠️ Could not set CPU affinity: {e}")
+#         print(f"⚠️  Could not set CPU affinity: {e}")
 #
+#     # Set process priority to be nice (lower priority)
 #     os.nice(5)
 #
-#     # Best hyperparameters for each gamma
+#     # hyperparameter tuning
+#     # gamma_values = [0.5]
+#     # dqn_hyperparameter_tuning_per_gamma(gamma_values, num_eval_seeds=1, use_loss=True)
+#
+#     # --- 1) Manually enter best hyperparams per gamma ---
 #     best_hyperparams = {
-#         0.1: {"learning_rate": 0.001, "hidden_dim": 64, "hidden_layers": 2},
-#         0.2: {"learning_rate": 0.001, "hidden_dim": 64, "hidden_layers": 2},
-#         0.3: {"learning_rate": 0.001, "hidden_dim": 128, "hidden_layers": 2},
-#         0.4: {"learning_rate": 0.001, "hidden_dim": 128, "hidden_layers": 2},
-#         0.5: {"learning_rate": 0.001, "hidden_dim": 128, "hidden_layers": 2},
-#         0.6: {"learning_rate": 0.001, "hidden_dim": 128, "hidden_layers": 2},
+#         0.1: {"learning_rate": 0.1, "hidden_dim": 16, "hidden_layers": 2},
+#         0.2: {"learning_rate": 0.1, "hidden_dim": 16, "hidden_layers": 2},
+#         0.3: {"learning_rate": 0.1, "hidden_dim": 16, "hidden_layers": 2},
+#         0.4: {"learning_rate": 0.01, "hidden_dim": 128, "hidden_layers": 2},
+#         0.5: {"learning_rate": 0.01, "hidden_dim": 64, "hidden_layers": 3},
+#         0.6: {"learning_rate": 0.01, "hidden_dim": 64, "hidden_layers": 3},
 #     }
 #
+#     # --- 2) Define your experimental sweep ---
 #     total_students_list = [100]
 #     num_classrooms_list = [2]
 #     action_levels_list = [3]
-#     alphas = [0.0]
+#     alphas = [0.0]  # keep fixed or expand
 #     num_seeds = 10
 #     max_steps = 73
 #     gamma_values = list(best_hyperparams.keys())
+#     # Shared logs
 #
+#     # --- 3) Run all CTDE experiments in one unified directory ---
 #     for total_students in total_students_list:
 #         for num_classrooms in num_classrooms_list:
 #             for action_levels in action_levels_list:
+#                 # Shared output dir for all gammas
 #                 out_dir = (
-#                     f"./results/centralized/"
+#                     f"./results/ctde-mc/"
 #                     f"all_gamma_ts{total_students}_nc{num_classrooms}_al{action_levels}"
 #                 )
 #                 os.makedirs(out_dir, exist_ok=True)
 #
-#                 print(f"📦 Running centralized sweep over gamma in folder: {out_dir}")
-#                 global_rows, ia_rows, time_rows = [], [], []
+#                 print(f"📦 Running CTDE-MC sweep over gamma in one folder: {out_dir}")
+#                 global_rows = []
+#                 ia_rows = []
+#                 time_rows = []
 #
+#                 # Run all gamma values using their respective hyperparameters
 #                 for gamma in gamma_values:
 #                     hyp = best_hyperparams[gamma]
 #                     lr, hd, hl = hyp["learning_rate"], hyp["hidden_dim"], hyp["hidden_layers"]
 #
-#                     print(f"→ CENTRALIZED | γ={gamma} | lr={lr} | hd={hd} | hl={hl} | students={total_students}")
+#                     print(
+#                         f"→ CTDE-MC | γ={gamma} | lr={lr} | hd={hd} | hl={hl} "
+#                         f"| students={total_students} | classes={num_classrooms} "
+#                         f"| levels={action_levels}"
+#                     )
 #
-#                     global_rows, ia_rows, time_rows = run_experiment_centralized(
+#                     global_rows, ia_rows, time_rows = run_ctde_experiment(
 #                         learning_rate=lr,
 #                         hidden_dim=hd,
 #                         hidden_layers=hl,
+#                         method="ctde-mc",
 #                         total_students=total_students,
 #                         num_classrooms=num_classrooms,
 #                         action_levels=action_levels,
-#                         gamma_values=[gamma],
+#                         gamma_values=[gamma],  # run 1 gamma at a time
 #                         alphas=alphas,
-#                         method="mc",  # or "td"
 #                         num_seeds=num_seeds,
 #                         max_steps=max_steps,
 #                         out_dir=out_dir,
@@ -812,9 +738,84 @@ if __name__ == "__main__":
 #                         time_rows=time_rows
 #                     )
 #
-#                 # Save once for all gamma values
-#                 pd.DataFrame(global_rows).to_csv(os.path.join(out_dir, "centr_mc_global_summary.csv"), index=False)
-#                 pd.DataFrame(ia_rows).to_csv(os.path.join(out_dir, "centr_mc_inf_allowed_summary.csv"), index=False)
-#                 pd.DataFrame(time_rows).to_csv(os.path.join(out_dir, "centr_mc_time_summary.csv"), index=False)
+#                 # Save once after all gammas
+#                 pd.DataFrame(global_rows).to_csv(os.path.join(out_dir, "ctde_mc_global_summary.csv"), index=False)
+#                 pd.DataFrame(ia_rows).to_csv(os.path.join(out_dir, "ctde_mc_inf_allowed_summary.csv"), index=False)
+#                 pd.DataFrame(time_rows).to_csv(os.path.join(out_dir, "ctde_mc_time_summary.csv"), index=False)
 #
-#     print("✅ All centralized experiments complete.")
+#     print("✅ All CTDE experiments with manual hyperparams are done.")
+
+if __name__ == "__main__":
+    # Set CPU affinity
+    try:
+        current_process = psutil.Process()
+        current_process.cpu_affinity([0, 1, 2, 3, 4, 5, 6, 7])
+        print(f"🧠 DQN Centralized training set to use CPU cores 0-7")
+    except Exception as e:
+        print(f"⚠️ Could not set CPU affinity: {e}")
+
+    os.nice(5)
+        # hyperparameter tuning
+    gamma_values = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6]
+    dqn_hyperparameter_tuning_per_gamma(gamma_values, num_eval_seeds=1, use_loss=False)
+
+    # # Best hyperparameters for each gamma
+    # best_hyperparams = {
+    #     0.1: {"learning_rate": 0.03, "hidden_dim": 128, "hidden_layers": 1},
+    #     0.2: {"learning_rate": 0.03, "hidden_dim": 128, "hidden_layers": 1},
+    #     0.3: {"learning_rate": 0.03, "hidden_dim": 128, "hidden_layers": 1},
+    #     0.4: {"learning_rate": 0.03, "hidden_dim": 128, "hidden_layers": 1},
+    #     0.5: {"learning_rate": 0.03, "hidden_dim": 64, "hidden_layers": 1},
+    #     0.6: {"learning_rate": 0.03, "hidden_dim": 128, "hidden_layers": 1},
+    # }
+    #
+    # total_students_list = [100]
+    # num_classrooms_list = [2]
+    # action_levels_list = [3]
+    # alphas = [0.0]
+    # num_seeds = 10
+    # max_steps = 73
+    # gamma_values = list(best_hyperparams.keys())
+    #
+    # for total_students in total_students_list:
+    #     for num_classrooms in num_classrooms_list:
+    #         for action_levels in action_levels_list:
+    #             out_dir = (
+    #                 f"./results/centralized_td/"
+    #                 f"all_gamma_ts{total_students}_nc{num_classrooms}_al{action_levels}"
+    #             )
+    #             os.makedirs(out_dir, exist_ok=True)
+    #
+    #             print(f"📦 Running centralized sweep over gamma in folder: {out_dir}")
+    #             global_rows, ia_rows, time_rows = [], [], []
+    #
+    #             for gamma in gamma_values:
+    #                 hyp = best_hyperparams[gamma]
+    #                 lr, hd, hl = hyp["learning_rate"], hyp["hidden_dim"], hyp["hidden_layers"]
+    #
+    #                 print(f"→ CENTRALIZED | γ={gamma} | lr={lr} | hd={hd} | hl={hl} | students={total_students}")
+    #
+    #                 global_rows, ia_rows, time_rows = run_experiment_centralized(
+    #                     learning_rate=lr,
+    #                     hidden_dim=hd,
+    #                     hidden_layers=hl,
+    #                     total_students=total_students,
+    #                     num_classrooms=num_classrooms,
+    #                     action_levels=action_levels,
+    #                     gamma_values=[gamma],
+    #                     alphas=alphas,
+    #                     method="td",  # or "td"
+    #                     num_seeds=num_seeds,
+    #                     max_steps=max_steps,
+    #                     out_dir=out_dir,
+    #                     global_rows=global_rows,
+    #                     ia_rows=ia_rows,
+    #                     time_rows=time_rows
+    #                 )
+    #
+    #             # Save once for all gamma values
+    #             pd.DataFrame(global_rows).to_csv(os.path.join(out_dir, "centr_td_global_summary.csv"), index=False)
+    #             pd.DataFrame(ia_rows).to_csv(os.path.join(out_dir, "centr_td_inf_allowed_summary.csv"), index=False)
+    #             pd.DataFrame(time_rows).to_csv(os.path.join(out_dir, "centr_td_time_summary.csv"), index=False)
+    #
+    # print("✅ All centralized experiments complete.")

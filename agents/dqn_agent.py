@@ -1233,10 +1233,9 @@ class DQNAgent:
         if return_loss:
             return loss_history
 
-    def train_centralized_mc_hyper(self, env,
+    def train_centralized_mc_hyper_loss(self, env,
                              max_steps: int = 30,
                              total_episodes: int = 1000,
-                             convergence_window: int = 20,
                              return_loss: bool = False):
         """
         Centralized MC training. If return_loss=True, returns per-episode losses.
@@ -1310,6 +1309,168 @@ class DQNAgent:
         if return_loss:
             return loss_history
 
+    def train_centralized_td_double(self, env,
+                             max_steps: int = 30,
+                             total_episodes: int = 1000,
+                             save_dir: str = None,
+                             return_rewards: bool = False):
+        """
+        Centralized TD training using Double-DQN style targets.
+        If return_rewards=True, returns per-episode total rewards.
+        Saves learning curve plot to save_dir if specified.
+        """
+        self.global_rewards.clear()
+        self.episode_rewards = {a: [] for a in self.agents}
+        reward_history = [] if return_rewards else None
+
+        for ep in range(1, total_episodes + 1):
+            states = env.reset()
+            ep_reward = 0.0
+
+            # decay epsilon at start of episode
+            self.epsilon = max(self.min_epsilon, self.epsilon * self.epsilon_decay)
+            if self.epsilon <= self.min_epsilon:
+                break
+
+            for t in range(max_steps):
+                js = np.concatenate([states[a] for a in self.agents])
+                if random.random() < self.epsilon:
+                    joint_act = [random.randrange(self.action_space_size)
+                                 for _ in self.agents]
+                else:
+                    with torch.no_grad():
+                        q_heads = self.network(torch.FloatTensor(js).unsqueeze(0))[0]
+                        joint_act = [int(q_heads[i].argmax()) for i in range(self.num_agents)]
+
+                next_states, rewards, dones, _ = env.step(
+                    {a: joint_act[i] for i, a in enumerate(self.agents)}
+                )
+                r_team = sum(rewards.values())
+                ep_reward += r_team
+
+                # Double-DQN TD targets:
+                q_heads = self.network(torch.FloatTensor(js).unsqueeze(0))[0]
+                q_taken = torch.stack([
+                    q_heads[i, joint_act[i]] for i in range(self.num_agents)
+                ])
+
+                js_next = torch.FloatTensor(np.concatenate([next_states[a] for a in self.agents])).unsqueeze(0)
+                with torch.no_grad():
+                    q_next_online = self.network(js_next)[0]
+                    q_next_target = self.target_network(js_next)[0]
+
+                td_targets = torch.stack([
+                    torch.tensor(rewards[a], dtype=q_taken.dtype) +
+                    self.gamma * q_next_target[i, q_next_online[i].argmax().item()]
+                    for i, a in enumerate(self.agents)
+                ])
+
+                loss = nn.MSELoss()(q_taken, td_targets)
+
+                self.optimizer.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.network.parameters(), max_norm=1.0)
+                self.optimizer.step()
+
+                states = next_states
+                if all(dones.values()):
+                    break
+
+            self.global_rewards.append(ep_reward)
+            for a in self.agents:
+                self.episode_rewards[a].append(ep_reward / self.num_agents)
+
+            self.target_network.load_state_dict(self.network.state_dict())
+
+            if return_rewards:
+                reward_history.append(ep_reward)
+
+        # Save learning curve plot if directory provided
+        os.makedirs(save_dir, exist_ok=True)
+        save_path = os.path.join(save_dir, f"avg_rewards_centralized_td_double_gamma_{env.gamma}.png")
+        self.plot_rewards(save_path)
+
+    def train_centralized_td_double_hyper_rewards(self, env,
+                             max_steps: int = 30,
+                             total_episodes: int = 1000,
+                             save_dir: str = None,
+                             return_rewards: bool = False):
+        """
+        Centralized TD training using Double-DQN style targets.
+        If return_rewards=True, returns per-episode total rewards.
+        Saves learning curve plot to save_dir if specified.
+        """
+        self.global_rewards.clear()
+        self.episode_rewards = {a: [] for a in self.agents}
+        reward_history = [] if return_rewards else None
+
+        for ep in range(1, total_episodes + 1):
+            states = env.reset()
+            ep_reward = 0.0
+
+            # decay epsilon at start of episode
+            self.epsilon = max(self.min_epsilon, self.epsilon * self.epsilon_decay)
+            if self.epsilon <= self.min_epsilon:
+                break
+
+            for t in range(max_steps):
+                js = np.concatenate([states[a] for a in self.agents])
+                if random.random() < self.epsilon:
+                    joint_act = [random.randrange(self.action_space_size)
+                                 for _ in self.agents]
+                else:
+                    with torch.no_grad():
+                        q_heads = self.network(torch.FloatTensor(js).unsqueeze(0))[0]
+                        joint_act = [int(q_heads[i].argmax()) for i in range(self.num_agents)]
+
+                next_states, rewards, dones, _ = env.step(
+                    {a: joint_act[i] for i, a in enumerate(self.agents)}
+                )
+                r_team = sum(rewards.values())
+                ep_reward += r_team
+
+                # Double-DQN TD targets:
+                q_heads = self.network(torch.FloatTensor(js).unsqueeze(0))[0]
+                q_taken = torch.stack([
+                    q_heads[i, joint_act[i]] for i in range(self.num_agents)
+                ])
+
+                js_next = torch.FloatTensor(np.concatenate([next_states[a] for a in self.agents])).unsqueeze(0)
+                with torch.no_grad():
+                    q_next_online = self.network(js_next)[0]
+                    q_next_target = self.target_network(js_next)[0]
+
+                td_targets = torch.stack([
+                    torch.tensor(rewards[a], dtype=q_taken.dtype) +
+                    self.gamma * q_next_target[i, q_next_online[i].argmax().item()]
+                    for i, a in enumerate(self.agents)
+                ])
+
+                loss = nn.MSELoss()(q_taken, td_targets)
+
+                self.optimizer.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.network.parameters(), max_norm=1.0)
+                self.optimizer.step()
+
+                states = next_states
+                if all(dones.values()):
+                    break
+
+            self.global_rewards.append(ep_reward)
+            for a in self.agents:
+                self.episode_rewards[a].append(ep_reward / self.num_agents)
+
+            self.target_network.load_state_dict(self.network.state_dict())
+
+            if return_rewards:
+                reward_history.append(ep_reward)
+
+        # return list of global rewards if asked
+        if return_rewards:
+            return reward_history
+
+
     def train_centralized_td(self, env,
                              max_steps: int = 30,
                              total_episodes: int = 1000,
@@ -1380,6 +1541,95 @@ class DQNAgent:
             for a in self.agents:
                 self.episode_rewards[a].append(ep_reward / self.num_agents)
             self.target_network.load_state_dict(self.network.state_dict())
+
+        if return_loss:
+            return loss_history
+
+    def train_centralized_td_double_hyper_loss(self, env,
+                                    max_steps: int = 30,
+                                    total_episodes: int = 1000,
+                                    save_dir: str = None,
+                                    return_loss: bool = False):
+        """
+        Centralized TD training using Double-DQN style targets with episode-based loss.
+        If return_loss=True, returns per-episode losses.
+        Saves learning curve plot to save_dir if specified.
+        """
+        self.global_rewards.clear()
+        self.episode_rewards = {a: [] for a in self.agents}
+        loss_history = [] if return_loss else None
+
+        for ep in range(1, total_episodes + 1):
+            states = env.reset()
+            ep_reward = 0.0
+            self.transition_buffer.clear()
+
+            # decay epsilon at start of episode
+            self.epsilon = max(self.min_epsilon, self.epsilon * self.epsilon_decay)
+            if self.epsilon <= self.min_epsilon:
+                break
+
+            # Collect full episode transitions
+            for t in range(max_steps):
+                js = np.concatenate([states[a] for a in self.agents])
+                if random.random() < self.epsilon:
+                    joint_act = [random.randrange(self.action_space_size)
+                                 for _ in self.agents]
+                else:
+                    with torch.no_grad():
+                        q_heads = self.network(torch.FloatTensor(js).unsqueeze(0))[0]
+                        joint_act = [int(q_heads[i].argmax()) for i in range(self.num_agents)]
+
+                next_states, rewards, dones, _ = env.step(
+                    {a: joint_act[i] for i, a in enumerate(self.agents)}
+                )
+                r_team = sum(rewards.values())
+                ep_reward += r_team
+
+                # Store transitions with next states for batched TD updates
+                self.transition_buffer.append((js, joint_act, r_team, next_states))
+
+                states = next_states
+                if all(dones.values()):
+                    break
+
+            # Batched TD loss over episode
+            total_loss = 0.0
+            for (js, joint_act, r_team, next_states) in self.transition_buffer:
+                q_heads = self.network(torch.FloatTensor(js).unsqueeze(0))[0]
+                q_taken = torch.stack([
+                    q_heads[i, joint_act[i]] for i in range(self.num_agents)
+                ])
+
+                js_next = torch.FloatTensor(np.concatenate([next_states[a] for a in self.agents])).unsqueeze(0)
+                with torch.no_grad():
+                    q_next_online = self.network(js_next)[0]
+                    q_next_target = self.target_network(js_next)[0]
+
+                td_targets = torch.stack([
+                    torch.tensor(r_team, dtype=q_taken.dtype) +
+                    self.gamma * q_next_target[i, q_next_online[i].argmax().item()]
+                    for i in range(self.num_agents)
+                ])
+
+                loss = nn.MSELoss()(q_taken, td_targets)
+                total_loss += loss
+
+            total_loss = total_loss / len(self.transition_buffer)
+            self.optimizer.zero_grad()
+            total_loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.network.parameters(), max_norm=1.0)
+            self.optimizer.step()
+
+            if return_loss:
+                loss_history.append(total_loss.item())
+
+            self.global_rewards.append(ep_reward)
+            for a in self.agents:
+                self.episode_rewards[a].append(ep_reward / self.num_agents)
+
+            self.target_network.load_state_dict(self.network.state_dict())
+
 
         if return_loss:
             return loss_history
@@ -1457,17 +1707,96 @@ class DQNAgent:
         if return_loss:
             return loss_history
 
-    def train_centralized_mc_hyper(self, env,
+    def train_centralized_mc(self, env,
                              max_steps: int = 30,
                              total_episodes: int = 1000,
-                             convergence_window: int = 20,
-                             return_loss: bool = False):
+                             save_dir: str = None,
+                             return_rewards: bool = False):
         """
-        Centralized MC training. If return_loss=True, returns per-episode losses.
+        Centralized Monte Carlo training.
+        If return_rewards=True, returns per-episode total rewards.
+        Saves learning curve plot to save_dir if specified.
         """
         self.global_rewards.clear()
         self.episode_rewards = {a: [] for a in self.agents}
-        loss_history = [] if return_loss else None
+        reward_history = [] if return_rewards else None
+
+        for ep in range(1, total_episodes + 1):
+            states = env.reset()
+            ep_reward = 0.0
+            self.transition_buffer.clear()
+
+            # decay epsilon at start of episode
+            self.epsilon = max(self.min_epsilon, self.epsilon * self.epsilon_decay)
+
+            # Collect one full episode
+            for t in range(max_steps):
+                js = np.concatenate([states[a] for a in self.agents])
+                if random.random() < self.epsilon:
+                    joint_act = [random.randrange(self.action_space_size)
+                                 for _ in self.agents]
+                else:
+                    with torch.no_grad():
+                        q_heads = self.network(torch.FloatTensor(js).unsqueeze(0))[0]
+                        joint_act = [int(q_heads[i].argmax()) for i in range(self.num_agents)]
+
+                next_states, rewards, dones, _ = env.step(
+                    {a: joint_act[i] for i, a in enumerate(self.agents)}
+                )
+                r_team = sum(rewards.values())
+                ep_reward += r_team
+                self.transition_buffer.append((js, joint_act, r_team))
+                states = next_states
+                if all(dones.values()):
+                    break
+
+            # Compute MC returns (team-average)
+            returns, G = [], 0.0
+            for (_, _, r) in reversed(self.transition_buffer):
+                G = r  # no bootstrapping
+                returns.insert(0, G)
+
+            # One gradient step over full episode
+            total_loss = 0.0
+            for (js, joint_act, _), G_t in zip(self.transition_buffer, returns):
+                q_heads = self.network(torch.FloatTensor(js).unsqueeze(0))[0]
+                q_taken = torch.stack([
+                    q_heads[i, joint_act[i]] for i in range(self.num_agents)
+                ])
+                target = torch.full_like(q_taken, G_t)
+                total_loss += nn.MSELoss()(q_taken, target)
+
+            total_loss = total_loss / len(self.transition_buffer)
+            self.optimizer.zero_grad()
+            total_loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.network.parameters(), max_norm=1.0)
+            self.optimizer.step()
+
+            self.global_rewards.append(ep_reward)
+            for a in self.agents:
+                self.episode_rewards[a].append(ep_reward / self.num_agents)
+
+            self.target_network.load_state_dict(self.network.state_dict())
+
+            if return_rewards:
+                reward_history.append(ep_reward)
+
+        # save learning curve plot if directory provided
+        os.makedirs(save_dir, exist_ok=True)
+        save_path = os.path.join(save_dir, f"avg_rewards_centralized_mc_gamma_{env.gamma}.png")
+        self.plot_rewards(save_path)
+
+    def train_centralized_mc_hyper_rewards(self, env,
+                                   max_steps: int = 30,
+                                   total_episodes: int = 1000,
+                                   return_rewards: bool = False):
+        """
+        Centralized MC training.
+        If return_rewards=True, returns per-episode total rewards.
+        """
+        self.global_rewards.clear()
+        self.episode_rewards = {a: [] for a in self.agents}
+        reward_history = [] if return_rewards else None
 
         for ep in range(1, total_episodes + 1):
             states = env.reset()
@@ -1499,7 +1828,7 @@ class DQNAgent:
             # Compute MC returns (team-average)
             returns, G = [], 0.0
             for (_, _, r) in reversed(self.transition_buffer):
-                G = r  # no bootstrapping, as in `train_mc_hyper`
+                G = r  # no bootstrapping
                 returns.insert(0, G)
 
             # One gradient step over full episode
@@ -1518,17 +1847,17 @@ class DQNAgent:
             torch.nn.utils.clip_grad_norm_(self.network.parameters(), 1.0)
             self.optimizer.step()
 
-            if return_loss:
-                loss_history.append(total_loss.item())
-
             self.global_rewards.append(ep_reward)
             for a in self.agents:
                 self.episode_rewards[a].append(ep_reward / self.num_agents)
 
             self.target_network.load_state_dict(self.network.state_dict())
 
-        if return_loss:
-            return loss_history
+            if return_rewards:
+                reward_history.append(ep_reward)
+
+        if return_rewards:
+            return reward_history
 
     def evaluate(self, env, max_steps=52, centralized=False):
         """
