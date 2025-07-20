@@ -481,8 +481,7 @@ class DQNAgent:
                 # 7) Double‐DQN TD targets
                 td_targets = torch.stack([
                     torch.tensor(rewards[a], dtype=torch.float32)
-                    + self.gamma
-                    * q_next_target[i, q_next_online[i].argmax().item()]
+                    + q_next_target[i, q_next_online[i].argmax().item()]
                     for i, a in enumerate(self.agents)
                 ]).to(q_taken.dtype)
 
@@ -560,7 +559,7 @@ class DQNAgent:
 
                 td_targets = torch.stack([
                     torch.tensor(rewards[a], dtype=torch.float32)
-                    + self.gamma * q_next_target[i, q_next_online[i].argmax().item()]
+                    + q_next_target[i, q_next_online[i].argmax().item()]
                     for i, a in enumerate(self.agents)
                 ]).to(q_taken.dtype)
 
@@ -1233,12 +1232,16 @@ class DQNAgent:
         if return_loss:
             return loss_history
 
-    def train_centralized_mc_hyper_loss(self, env,
-                             max_steps: int = 30,
-                             total_episodes: int = 1000,
-                             return_loss: bool = False):
+    def train_centralized_td_double_hyper_loss(self,
+                                               env,
+                                               max_steps: int = 30,
+                                               total_episodes: int = 1000,
+                                               save_dir: str = None,
+                                               return_loss: bool = False):
         """
-        Centralized MC training. If return_loss=True, returns per-episode losses.
+        Centralized TD training using Double-DQN style targets with per-step loss tracking.
+        Uses explicit centralized epsilon-greedy joint action selection (no select_joint_actions call).
+        Returns list of average losses per episode if return_loss=True.
         """
         self.global_rewards.clear()
         self.episode_rewards = {a: [] for a in self.agents}
@@ -1247,77 +1250,86 @@ class DQNAgent:
         for ep in range(1, total_episodes + 1):
             states = env.reset()
             ep_reward = 0.0
-            self.transition_buffer.clear()
-            self.epsilon = max(self.min_epsilon, self.epsilon * self.epsilon_decay)
-            if self.epsilon <= self.min_epsilon:
-                break
+            episode_loss = 0.0
+            loss_steps = 0
 
-            # collect one full episode
+            # Decay epsilon at the start of episode
+            self.epsilon = max(self.min_epsilon, self.epsilon * self.epsilon_decay)
+
             for t in range(max_steps):
-                js = np.concatenate([states[a] for a in self.agents])
+                joint_state = np.concatenate([states[a] for a in self.agents])
+
+                # Explicit centralized epsilon-greedy joint action selection
                 if random.random() < self.epsilon:
-                    joint_act = [random.randrange(self.action_space_size)
-                                 for _ in self.agents]
+                    joint_action = [random.randrange(self.action_space_size) for _ in self.agents]
                 else:
                     with torch.no_grad():
-                        q_heads = self.network(
-                            torch.FloatTensor(js).unsqueeze(0)
-                        )[0]
-                        joint_act = [int(q_heads[i].argmax())
-                                     for i in range(self.num_agents)]
+                        q_vals = self.network(torch.FloatTensor(joint_state).unsqueeze(0))[0]
+                        joint_action = [int(q_vals[i].argmax()) for i in range(len(self.agents))]
 
-                next_states, rewards, dones, _ = env.step(
-                    {a: joint_act[i] for i, a in enumerate(self.agents)}
-                )
-                r_team = sum(rewards.values())
+                actions = {a: joint_action[i] for i, a in enumerate(self.agents)}
+
+                next_states, rewards, dones, _ = env.step(actions)
+                # Average team reward
+                r_team = sum(rewards.values()) / len(self.agents)
                 ep_reward += r_team
-                self.transition_buffer.append((js, joint_act, r_team))
+
+                # Q values for current joint state and taken joint actions
+                q_vals = self.network(torch.FloatTensor(joint_state).unsqueeze(0))[0]
+                q_joint = sum(q_vals[i, joint_action[i]] for i in range(len(self.agents)))
+
+                # Next state Q values for Double-DQN target
+                next_joint_state = np.concatenate([next_states[a] for a in self.agents])
+                with torch.no_grad():
+                    q_next_online = self.network(torch.FloatTensor(next_joint_state).unsqueeze(0))[0]
+                    q_next_target = self.target_network(torch.FloatTensor(next_joint_state).unsqueeze(0))[0]
+
+                best_next = sum(
+                    q_next_target[i, q_next_online[i].argmax().item()] for i in range(len(self.agents))) / len(
+                    self.agents)
+
+                # TD target (no discounting applied here)
+                y = r_team + best_next
+
+                # Compute loss: MSE between predicted Q and target
+                loss = nn.MSELoss()(q_joint, torch.tensor(y))
+
+                self.optimizer.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.network.parameters(), max_norm=1.0)
+                self.optimizer.step()
+
+                episode_loss += loss.item()
+                loss_steps += 1
+
                 states = next_states
                 if all(dones.values()):
                     break
 
-            # compute MC-targets
-            returns, G = [], 0.0
-            for (_, _, r) in reversed(self.transition_buffer):
-                G = r + self.gamma * G
-                returns.insert(0, G)
-
-            # batched gradient step
-            total_loss = 0.0
-            for (js, joint_act, _), G_t in zip(self.transition_buffer, returns):
-                q_heads = self.network(
-                    torch.FloatTensor(js).unsqueeze(0)
-                )[0]
-                q_joint = sum(q_heads[i, joint_act[i]]
-                              for i in range(self.num_agents))
-                total_loss += nn.MSELoss()(q_joint, torch.tensor(G_t))
-
-            total_loss = total_loss / len(self.transition_buffer)
-            self.optimizer.zero_grad()
-            total_loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.network.parameters(), 1.0)
-            self.optimizer.step()
-
             if return_loss:
-                loss_history.append(total_loss.item())
+                avg_loss = episode_loss / max(loss_steps, 1)
+                loss_history.append(avg_loss)
 
             self.global_rewards.append(ep_reward)
             for a in self.agents:
-                self.episode_rewards[a].append(ep_reward / self.num_agents)
+                self.episode_rewards[a].append(ep_reward / len(self.agents))
+
             self.target_network.load_state_dict(self.network.state_dict())
 
         if return_loss:
             return loss_history
 
-    def train_centralized_td_double(self, env,
-                             max_steps: int = 30,
-                             total_episodes: int = 1000,
-                             save_dir: str = None,
-                             return_rewards: bool = False):
+    def train_centralized_td_double(self,
+                                    env,
+                                    max_steps: int = 30,
+                                    total_episodes: int = 1000,
+                                    save_dir: str = None,
+                                    return_rewards: bool = False):
         """
         Centralized TD training using Double-DQN style targets.
+        Uses explicit centralized epsilon-greedy joint action selection for training and execution.
         If return_rewards=True, returns per-episode total rewards.
-        Saves learning curve plot to save_dir if specified.
+        Saves reward learning curve plot if save_dir specified.
         """
         self.global_rewards.clear()
         self.episode_rewards = {a: [] for a in self.agents}
@@ -1327,45 +1339,47 @@ class DQNAgent:
             states = env.reset()
             ep_reward = 0.0
 
-            # decay epsilon at start of episode
+            # Decay epsilon at the start of episode
             self.epsilon = max(self.min_epsilon, self.epsilon * self.epsilon_decay)
             if self.epsilon <= self.min_epsilon:
                 break
 
             for t in range(max_steps):
-                js = np.concatenate([states[a] for a in self.agents])
+                joint_state = np.concatenate([states[a] for a in self.agents])
+
+                # Explicit centralized epsilon-greedy joint action selection
                 if random.random() < self.epsilon:
-                    joint_act = [random.randrange(self.action_space_size)
-                                 for _ in self.agents]
+                    joint_action = [random.randrange(self.action_space_size) for _ in self.agents]
                 else:
                     with torch.no_grad():
-                        q_heads = self.network(torch.FloatTensor(js).unsqueeze(0))[0]
-                        joint_act = [int(q_heads[i].argmax()) for i in range(self.num_agents)]
+                        q_heads = self.network(torch.FloatTensor(joint_state).unsqueeze(0))[0]
+                        joint_action = [int(q_heads[i].argmax()) for i in range(len(self.agents))]
 
-                next_states, rewards, dones, _ = env.step(
-                    {a: joint_act[i] for i, a in enumerate(self.agents)}
-                )
-                r_team = sum(rewards.values())
+                actions = {a: joint_action[i] for i, a in enumerate(self.agents)}
+
+                next_states, rewards, dones, _ = env.step(actions)
+                # Average team reward
+                r_team = sum(rewards.values()) / len(self.agents)
                 ep_reward += r_team
 
-                # Double-DQN TD targets:
-                q_heads = self.network(torch.FloatTensor(js).unsqueeze(0))[0]
-                q_taken = torch.stack([
-                    q_heads[i, joint_act[i]] for i in range(self.num_agents)
-                ])
+                # Q values for current joint state and taken joint actions
+                q_vals = self.network(torch.FloatTensor(joint_state).unsqueeze(0))[0]
+                q_joint = sum(q_vals[i, joint_action[i]] for i in range(len(self.agents)))
 
-                js_next = torch.FloatTensor(np.concatenate([next_states[a] for a in self.agents])).unsqueeze(0)
+                # Next state Q values for Double-DQN target
+                next_joint_state = np.concatenate([next_states[a] for a in self.agents])
                 with torch.no_grad():
-                    q_next_online = self.network(js_next)[0]
-                    q_next_target = self.target_network(js_next)[0]
+                    q_next_online = self.network(torch.FloatTensor(next_joint_state).unsqueeze(0))[0]
+                    q_next_target = self.target_network(torch.FloatTensor(next_joint_state).unsqueeze(0))[0]
+                    best_next = sum(
+                        q_next_target[i, q_next_online[i].argmax().item()] for i in range(len(self.agents))) / len(
+                        self.agents)
 
-                td_targets = torch.stack([
-                    torch.tensor(rewards[a], dtype=q_taken.dtype) +
-                    self.gamma * q_next_target[i, q_next_online[i].argmax().item()]
-                    for i, a in enumerate(self.agents)
-                ])
+                # TD target without discounting
+                y = r_team + best_next
 
-                loss = nn.MSELoss()(q_taken, td_targets)
+                # Compute loss
+                loss = nn.MSELoss()(q_joint, torch.tensor(y))
 
                 self.optimizer.zero_grad()
                 loss.backward()
@@ -1378,98 +1392,100 @@ class DQNAgent:
 
             self.global_rewards.append(ep_reward)
             for a in self.agents:
-                self.episode_rewards[a].append(ep_reward / self.num_agents)
+                self.episode_rewards[a].append(ep_reward / len(self.agents))
 
             self.target_network.load_state_dict(self.network.state_dict())
 
             if return_rewards:
                 reward_history.append(ep_reward)
 
-        # Save learning curve plot if directory provided
-        os.makedirs(save_dir, exist_ok=True)
-        save_path = os.path.join(save_dir, f"avg_rewards_centralized_td_double_gamma_{env.gamma}.png")
-        self.plot_rewards(save_path)
+        if save_dir is not None:
+            os.makedirs(save_dir, exist_ok=True)
+            save_path = os.path.join(save_dir, f"avg_rewards_centralized_td_double_gamma_{env.gamma}.png")
+            self.plot_rewards(save_path)
 
-    def train_centralized_td_double_hyper_rewards(self, env,
-                             max_steps: int = 30,
-                             total_episodes: int = 1000,
-                             save_dir: str = None,
-                             return_rewards: bool = False):
-        """
-        Centralized TD training using Double-DQN style targets.
-        If return_rewards=True, returns per-episode total rewards.
-        Saves learning curve plot to save_dir if specified.
-        """
-        self.global_rewards.clear()
-        self.episode_rewards = {a: [] for a in self.agents}
-        reward_history = [] if return_rewards else None
-
-        for ep in range(1, total_episodes + 1):
-            states = env.reset()
-            ep_reward = 0.0
-
-            # decay epsilon at start of episode
-            self.epsilon = max(self.min_epsilon, self.epsilon * self.epsilon_decay)
-            if self.epsilon <= self.min_epsilon:
-                break
-
-            for t in range(max_steps):
-                js = np.concatenate([states[a] for a in self.agents])
-                if random.random() < self.epsilon:
-                    joint_act = [random.randrange(self.action_space_size)
-                                 for _ in self.agents]
-                else:
-                    with torch.no_grad():
-                        q_heads = self.network(torch.FloatTensor(js).unsqueeze(0))[0]
-                        joint_act = [int(q_heads[i].argmax()) for i in range(self.num_agents)]
-
-                next_states, rewards, dones, _ = env.step(
-                    {a: joint_act[i] for i, a in enumerate(self.agents)}
-                )
-                r_team = sum(rewards.values())
-                ep_reward += r_team
-
-                # Double-DQN TD targets:
-                q_heads = self.network(torch.FloatTensor(js).unsqueeze(0))[0]
-                q_taken = torch.stack([
-                    q_heads[i, joint_act[i]] for i in range(self.num_agents)
-                ])
-
-                js_next = torch.FloatTensor(np.concatenate([next_states[a] for a in self.agents])).unsqueeze(0)
-                with torch.no_grad():
-                    q_next_online = self.network(js_next)[0]
-                    q_next_target = self.target_network(js_next)[0]
-
-                td_targets = torch.stack([
-                    torch.tensor(rewards[a], dtype=q_taken.dtype) +
-                    self.gamma * q_next_target[i, q_next_online[i].argmax().item()]
-                    for i, a in enumerate(self.agents)
-                ])
-
-                loss = nn.MSELoss()(q_taken, td_targets)
-
-                self.optimizer.zero_grad()
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.network.parameters(), max_norm=1.0)
-                self.optimizer.step()
-
-                states = next_states
-                if all(dones.values()):
-                    break
-
-            self.global_rewards.append(ep_reward)
-            for a in self.agents:
-                self.episode_rewards[a].append(ep_reward / self.num_agents)
-
-            self.target_network.load_state_dict(self.network.state_dict())
-
-            if return_rewards:
-                reward_history.append(ep_reward)
-
-        # return list of global rewards if asked
         if return_rewards:
             return reward_history
 
+    def train_centralized_td_double_hyper_rewards(self,
+                                                  env,
+                                                  max_steps: int = 30,
+                                                  total_episodes: int = 1000,
+                                                  save_dir: str = None,
+                                                  return_rewards: bool = False):
+        """
+        Centralized TD training using Double-DQN style targets.
+        If return_rewards=True, returns per-episode total rewards.
+        Saves learning curve plot to save_dir if specified.
+        """
+        self.global_rewards.clear()
+        self.episode_rewards = {a: [] for a in self.agents}
+        reward_history = [] if return_rewards else None
+
+        for ep in range(1, total_episodes + 1):
+            states = env.reset()
+            ep_reward = 0.0
+
+            # Decay epsilon at the start of episode
+            self.epsilon = max(self.min_epsilon, self.epsilon * self.epsilon_decay)
+            if self.epsilon <= self.min_epsilon:
+                break
+
+            for t in range(max_steps):
+                joint_state = np.concatenate([states[a] for a in self.agents])
+
+                # Explicit centralized epsilon-greedy joint action selection
+                if random.random() < self.epsilon:
+                    joint_act = [random.randrange(self.action_space_size) for _ in self.agents]
+                else:
+                    with torch.no_grad():
+                        q_heads = self.network(torch.FloatTensor(joint_state).unsqueeze(0))[0]
+                        joint_act = [int(q_heads[i].argmax()) for i in range(len(self.agents))]
+
+                actions = {a: joint_act[i] for i, a in enumerate(self.agents)}
+
+                next_states, rewards, dones, _ = env.step(actions)
+                # Average team reward
+                r_team = sum(rewards.values()) / len(self.agents)
+                ep_reward += r_team
+
+                # Double-DQN TD targets
+                q_heads = self.network(torch.FloatTensor(joint_state).unsqueeze(0))[0]
+                q_taken = torch.stack([q_heads[i, joint_act[i]] for i in range(len(self.agents))])
+
+                js_next = torch.FloatTensor(np.concatenate([next_states[a] for a in self.agents])).unsqueeze(0)
+                with torch.no_grad():
+                    q_next_online = self.network(js_next)[0]
+                    q_next_target = self.target_network(js_next)[0]
+
+                td_targets = torch.stack([
+                    torch.tensor(rewards[a], dtype=q_taken.dtype) +
+                    q_next_target[i, q_next_online[i].argmax().item()]
+                    for i, a in enumerate(self.agents)
+                ])
+
+                loss = nn.MSELoss()(q_taken, td_targets)
+
+                self.optimizer.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.network.parameters(), max_norm=1.0)
+                self.optimizer.step()
+
+                states = next_states
+                if all(dones.values()):
+                    break
+
+            self.global_rewards.append(ep_reward)
+            for a in self.agents:
+                self.episode_rewards[a].append(ep_reward / len(self.agents))
+
+            self.target_network.load_state_dict(self.network.state_dict())
+
+            if return_rewards:
+                reward_history.append(ep_reward)
+
+        if return_rewards:
+            return reward_history
 
     def train_centralized_td(self, env,
                              max_steps: int = 30,
@@ -1545,15 +1561,16 @@ class DQNAgent:
         if return_loss:
             return loss_history
 
-    def train_centralized_td_double_hyper_loss(self, env,
-                                    max_steps: int = 30,
-                                    total_episodes: int = 1000,
-                                    save_dir: str = None,
-                                    return_loss: bool = False):
+    def train_centralized_td_double_hyper_loss(self,
+                                               env,
+                                               max_steps: int = 30,
+                                               total_episodes: int = 1000,
+                                               save_dir: str = None,
+                                               return_loss: bool = False):
         """
-        Centralized TD training using Double-DQN style targets with episode-based loss.
-        If return_loss=True, returns per-episode losses.
-        Saves learning curve plot to save_dir if specified.
+        Centralized TD training using Double-DQN style targets with per-step loss tracking.
+        Uses joint action selection for centralized training and execution.
+        Returns list of average losses per episode if return_loss=True.
         """
         self.global_rewards.clear()
         self.episode_rewards = {a: [] for a in self.agents}
@@ -1562,74 +1579,67 @@ class DQNAgent:
         for ep in range(1, total_episodes + 1):
             states = env.reset()
             ep_reward = 0.0
-            self.transition_buffer.clear()
+            episode_loss = 0.0
+            loss_steps = 0
 
-            # decay epsilon at start of episode
             self.epsilon = max(self.min_epsilon, self.epsilon * self.epsilon_decay)
-            if self.epsilon <= self.min_epsilon:
-                break
 
-            # Collect full episode transitions
             for t in range(max_steps):
-                js = np.concatenate([states[a] for a in self.agents])
-                if random.random() < self.epsilon:
-                    joint_act = [random.randrange(self.action_space_size)
-                                 for _ in self.agents]
-                else:
-                    with torch.no_grad():
-                        q_heads = self.network(torch.FloatTensor(js).unsqueeze(0))[0]
-                        joint_act = [int(q_heads[i].argmax()) for i in range(self.num_agents)]
+                joint_state = np.concatenate([states[a] for a in self.agents])
 
-                next_states, rewards, dones, _ = env.step(
-                    {a: joint_act[i] for i, a in enumerate(self.agents)}
-                )
-                r_team = sum(rewards.values())
+                # centralized joint action selection
+                if random.random() < self.epsilon:
+                    joint_action = [random.randrange(self.action_space_size) for _ in self.agents]
+                else:
+                    joint_action = self.select_joint_actions(joint_state)
+
+                actions = {a: joint_action[i] for i, a in enumerate(self.agents)}
+
+                next_states, rewards, dones, _ = env.step(actions)
+                # r_team = sum(rewards.values())
+                r_team = sum(rewards.values()) / len(self.agents)
                 ep_reward += r_team
 
-                # Store transitions with next states for batched TD updates
-                self.transition_buffer.append((js, joint_act, r_team, next_states))
+                q_vals = self.network(torch.FloatTensor(joint_state).unsqueeze(0))[0]
+                q_joint = sum(q_vals[i, joint_action[i]] for i in range(len(self.agents)))
+
+                next_joint_state = np.concatenate([next_states[a] for a in self.agents])
+                with torch.no_grad():
+                    q_next_online = self.network(torch.FloatTensor(next_joint_state).unsqueeze(0))[0]
+                    q_next_target = self.target_network(torch.FloatTensor(next_joint_state).unsqueeze(0))[0]
+
+                best_next = sum(q_next_target[i, q_next_online[i].argmax().item()] for i in range(len(self.agents)))/len(self.agents)
+
+                y = r_team + best_next
+
+                loss = nn.MSELoss()(q_joint, torch.tensor(y))
+
+                self.optimizer.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.network.parameters(), max_norm=1.0)
+                self.optimizer.step()
+
+                episode_loss += loss.item()
+                loss_steps += 1
 
                 states = next_states
                 if all(dones.values()):
                     break
 
-            # Batched TD loss over episode
-            total_loss = 0.0
-            for (js, joint_act, r_team, next_states) in self.transition_buffer:
-                q_heads = self.network(torch.FloatTensor(js).unsqueeze(0))[0]
-                q_taken = torch.stack([
-                    q_heads[i, joint_act[i]] for i in range(self.num_agents)
-                ])
-
-                js_next = torch.FloatTensor(np.concatenate([next_states[a] for a in self.agents])).unsqueeze(0)
-                with torch.no_grad():
-                    q_next_online = self.network(js_next)[0]
-                    q_next_target = self.target_network(js_next)[0]
-
-                td_targets = torch.stack([
-                    torch.tensor(r_team, dtype=q_taken.dtype) +
-                    self.gamma * q_next_target[i, q_next_online[i].argmax().item()]
-                    for i in range(self.num_agents)
-                ])
-
-                loss = nn.MSELoss()(q_taken, td_targets)
-                total_loss += loss
-
-            total_loss = total_loss / len(self.transition_buffer)
-            self.optimizer.zero_grad()
-            total_loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.network.parameters(), max_norm=1.0)
-            self.optimizer.step()
-
             if return_loss:
-                loss_history.append(total_loss.item())
+                avg_loss = episode_loss / max(loss_steps, 1)
+                loss_history.append(avg_loss)
 
             self.global_rewards.append(ep_reward)
             for a in self.agents:
-                self.episode_rewards[a].append(ep_reward / self.num_agents)
+                self.episode_rewards[a].append(ep_reward / len(self.agents))
 
             self.target_network.load_state_dict(self.network.state_dict())
 
+        # if save_dir is not None:
+        #     os.makedirs(save_dir, exist_ok=True)
+        #     save_path = os.path.join(save_dir, f"avg_rewards_centralized_td_double_gamma_{env.gamma}.png")
+        #     self.plot_rewards(save_path)
 
         if return_loss:
             return loss_history
@@ -1685,7 +1695,7 @@ class DQNAgent:
                     qn = self.target_network(torch.FloatTensor(js_next).unsqueeze(0))[0]
                     best_sum = sum(qn[i].max().item() for i in range(self.num_agents))
 
-                y = r_team + self.gamma * best_sum
+                y = r_team + best_sum
                 loss = nn.MSELoss()(q_joint, torch.tensor(y))
                 total_loss += loss
 
@@ -1786,22 +1796,26 @@ class DQNAgent:
         save_path = os.path.join(save_dir, f"avg_rewards_centralized_mc_gamma_{env.gamma}.png")
         self.plot_rewards(save_path)
 
-    def train_centralized_mc_hyper_rewards(self, env,
-                                   max_steps: int = 30,
-                                   total_episodes: int = 1000,
-                                   return_rewards: bool = False):
+    def train_centralized_mc_loss(self, env,
+                             max_steps: int = 30,
+                             total_episodes: int = 1000,
+                             save_dir: str = None,
+                             return_loss: bool = False):
         """
-        Centralized MC training.
-        If return_rewards=True, returns per-episode total rewards.
+        Centralized Monte Carlo training.
+        If return_loss=True, returns list of average losses per episode.
+        Saves learning curve plot to save_dir if specified.
         """
         self.global_rewards.clear()
         self.episode_rewards = {a: [] for a in self.agents}
-        reward_history = [] if return_rewards else None
+        loss_history = [] if return_loss else None
 
         for ep in range(1, total_episodes + 1):
             states = env.reset()
             ep_reward = 0.0
             self.transition_buffer.clear()
+
+            # Decay epsilon at start of episode
             self.epsilon = max(self.min_epsilon, self.epsilon * self.epsilon_decay)
 
             # Collect one full episode
@@ -1841,10 +1855,10 @@ class DQNAgent:
                 target = torch.full_like(q_taken, G_t)
                 total_loss += nn.MSELoss()(q_taken, target)
 
-            total_loss = total_loss / len(self.transition_buffer)
+            avg_loss = total_loss / max(len(self.transition_buffer), 1)
             self.optimizer.zero_grad()
-            total_loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.network.parameters(), 1.0)
+            avg_loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.network.parameters(), max_norm=1.0)
             self.optimizer.step()
 
             self.global_rewards.append(ep_reward)
@@ -1853,11 +1867,93 @@ class DQNAgent:
 
             self.target_network.load_state_dict(self.network.state_dict())
 
-            if return_rewards:
-                reward_history.append(ep_reward)
+            if return_loss:
+                loss_history.append(avg_loss.item())
 
-        if return_rewards:
-            return reward_history
+        # if save_dir is not None:
+        #     os.makedirs(save_dir, exist_ok=True)
+        #     save_path = os.path.join(save_dir, f"avg_rewards_centralized_mc_gamma_{env.gamma}.png")
+        #     self.plot_rewards(save_path)
+
+        if return_loss:
+            return loss_history
+
+    # def train_centralized_td_double_hyper_rewards(self,
+    #                                               env,
+    #                                               max_steps: int = 30,
+    #                                               total_episodes: int = 1000,
+    #                                               save_dir: str = None,
+    #                                               return_rewards: bool = False):
+    #     """
+    #     Centralized joint TD training using Double-DQN targets without discounting.
+    #     Returns per-episode total rewards if return_rewards=True.
+    #     """
+    #     self.global_rewards.clear()
+    #     self.episode_rewards = {a: [] for a in self.agents}
+    #     reward_history = [] if return_rewards else None
+    #
+    #     for ep in range(1, total_episodes + 1):
+    #         states = env.reset()
+    #         ep_reward = 0.0
+    #
+    #         self.epsilon = max(self.min_epsilon, self.epsilon * self.epsilon_decay)
+    #         if self.epsilon <= self.min_epsilon:
+    #             break
+    #
+    #         for step in range(max_steps):
+    #             joint_state = np.concatenate([states[a] for a in self.agents])
+    #
+    #             # Use centralized joint action selection that handles epsilon internally
+    #             joint_action = self.select_joint_actions(joint_state)
+    #
+    #             actions = {a: joint_action[i] for i, a in enumerate(self.agents)}
+    #
+    #             next_states, rewards, dones, _ = env.step(actions)
+    #             # r_joint = sum(rewards.values())
+    #             r_team = sum(rewards.values()) / len(self.agents)
+    #             ep_reward += r_team
+    #
+    #             q_vals = self.network(torch.FloatTensor(joint_state).unsqueeze(0))[0]
+    #             q_joint = sum(q_vals[i, joint_action[i]] for i in range(len(self.agents)))
+    #
+    #             next_joint_state = np.concatenate([next_states[a] for a in self.agents])
+    #             with torch.no_grad():
+    #                 q_next_online = self.network(torch.FloatTensor(next_joint_state).unsqueeze(0))[0]
+    #                 q_next_target = self.target_network(torch.FloatTensor(next_joint_state).unsqueeze(0))[0]
+    #
+    #             best_next = sum(q_next_target[i, q_next_online[i].argmax().item()] for i in range(len(self.agents)))/len(self.agents)
+    #
+    #             # TD target without gamma (discounting)
+    #             y = r_team + best_next
+    #
+    #             loss = nn.MSELoss()(q_joint, torch.tensor(y))
+    #
+    #             self.optimizer.zero_grad()
+    #             loss.backward()
+    #             torch.nn.utils.clip_grad_norm_(self.network.parameters(), max_norm=1.0)
+    #             self.optimizer.step()
+    #
+    #             states = next_states
+    #             if all(dones.values()):
+    #                 break
+    #
+    #         self.global_rewards.append(ep_reward)
+    #         for a in self.agents:
+    #             self.episode_rewards[a].append(ep_reward / len(self.agents))
+    #
+    #         self.target_network.load_state_dict(self.network.state_dict())
+    #
+    #         if return_rewards:
+    #             reward_history.append(ep_reward)
+    #
+    #     # Optional saving of plots (commented out)
+    #     # if save_dir is not None:
+    #     #     os.makedirs(save_dir, exist_ok=True)
+    #     #     save_path = os.path.join(save_dir, f"avg_rewards_centralized_td_double_gamma_{env.gamma}.png")
+    #     #     self.plot_rewards(save_path)
+    #
+    #     if return_rewards:
+    #         return reward_history
 
     def evaluate(self, env, max_steps=52, centralized=False):
         """
