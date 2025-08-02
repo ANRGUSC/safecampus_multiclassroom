@@ -145,7 +145,7 @@ def visualize_all_states_dqn(
     infected_vals = np.linspace(0, max_inf,     N).astype(int)
 
     # 5) Create figure and axes
-    fig, axes = plt.subplots(nrows, ncols, figsize=(5*ncols, 5*nrows), squeeze=False)
+    fig, axes = plt.subplots(nrows, ncols, figsize=(5*ncols, 5*nrows), squeeze=False, sharex=True, sharey=True)
     axes_flat = axes.flatten()
 
     # 6) Plot each agent
@@ -204,7 +204,7 @@ def visualize_all_states_dqn(
     ]
 
     # leave room for legend
-    fig.subplots_adjust(bottom=0.15, hspace=0.4)
+    fig.subplots_adjust(left=0.05, right=0.97, bottom=0.15, hspace=0.4, wspace=0.15)
     fig.legend(
         handles=action_patches,
         loc='lower center',
@@ -216,7 +216,7 @@ def visualize_all_states_dqn(
 
     # 9) Title & layout
     # title per gamma value
-    fig.suptitle(f"{method}-CTDE Policy Map (w={gamma:.2f})", fontsize=16)
+    fig.suptitle(f"CTDE-{method} Policy (w={gamma:.2f})", fontsize=16)
     plt.tight_layout(rect=[0, 0.15, 1, 0.95])
 
     # 10) Save and close
@@ -226,6 +226,156 @@ def visualize_all_states_dqn(
     print(f"Saved policy visualization to {save_path}")
 
     return save_path
+
+
+
+
+
+def visualize_all_states_dqn_swap(
+    method,
+    agents,
+    env,
+    dqn_agent,
+    save_path="results/policy_visualization.png",
+    gamma=0.1,
+    grid_size=100,
+    swap_policy_agent=None
+):
+    """
+    Flexible grid layout:
+      • 1–3 agents → 1×n row
+      •  4 agents  → 2×2
+      • >4 agents  → √n×√n (assumes n is a perfect square)
+    Each panel shows a grid_size×grid_size policy map via imshow with square cells.
+
+    If swap_policy_agent is provided (agent name), then all classrooms use that agent's
+    policy for action selection during visualization.
+    """
+    n_agents = len(agents)
+
+    # 1) Build colormap
+    num_actions = env.action_spaces[agents[0]].n
+    action_colors = generate_distinct_colors(num_actions)
+    cmap = ListedColormap(action_colors)
+    norm = BoundaryNorm(np.arange(num_actions+1)-0.5, ncolors=num_actions)
+
+    # 2) Determine subplot layout
+    if n_agents <= 3:
+        nrows, ncols = 1, n_agents
+    elif n_agents == 4:
+        nrows, ncols = 2, 2
+    else:
+        side = int(math.sqrt(n_agents))
+        if side * side != n_agents:
+            raise ValueError(f"n_agents={n_agents} >4 must be a perfect square")
+        nrows = ncols = side
+
+    # 3) Data ranges & baseline
+    max_inf = max(i for i, _ in env.state_space)
+    min_risk, max_risk = min(r for _, r in env.state_space), max(r for _, r in env.state_space)
+    baseline_state = np.array([50, 0.5])
+
+    # 4) Build fixed lattice
+    N = grid_size
+    risk_vals     = np.linspace(min_risk, max_risk, N)
+    infected_vals = np.linspace(0, max_inf,     N).astype(int)
+
+    # 5) Create figure and axes
+    fig, axes = plt.subplots(nrows, ncols, figsize=(5*ncols, 5*nrows), squeeze=False)
+    axes_flat = axes.flatten()
+
+    # 6) Plot each agent
+    for idx, agent_name in enumerate(agents):
+        ax = axes_flat[idx]
+        # compute policy array
+        policy = np.empty((N, N), dtype=int)
+        for yi, inf in enumerate(infected_vals):
+            for xi, risk in enumerate(risk_vals):
+                # Compose joint state vector for all agents
+                joint = []
+                for ag in agents:
+                    if ag == agent_name:
+                        # For this panel, agent's own state is infected,risk
+                        joint.extend([int(inf), float(risk)])
+                    else:
+                        # Other agents set to baseline
+                        joint.extend(baseline_state)
+
+                # If swap_policy_agent is set, override the policy agent to swap_policy_agent
+                if swap_policy_agent is not None:
+                    # Select action according to swap_policy_agent for all agents
+                    policy[yi, xi] = dqn_agent.select_action(
+                        swap_policy_agent, np.array([int(inf), float(risk)])
+                    )
+                else:
+                    # Normal: select action of current agent
+                    policy[yi, xi] = dqn_agent.select_action(
+                        agent_name, np.array([int(inf), float(risk)])
+                    )
+
+        # render with square cells
+        ax.imshow(
+            policy,
+            origin='lower',
+            cmap=cmap,
+            norm=norm,
+            interpolation='nearest',
+            aspect='equal'
+        )
+        # relabel ticks back to data units
+        ticks = [0, N//2, N-1]
+        ax.set_xticks(ticks)
+        ax.set_xticklabels([
+            f"{min_risk:.2f}",
+            f"{(min_risk+max_risk)/2:.2f}",
+            f"{max_risk:.2f}"
+        ])
+        ax.set_yticks(ticks)
+        ax.set_yticklabels([
+            "0",
+            f"{max_inf/2:.0f}",
+            f"{max_inf:.0f}"
+        ])
+        ax.set_title(agent_name)
+        ax.set_xlabel("Community Risk")
+        ax.set_ylabel("Infected Students")
+
+    # 7) Turn off any unused subplots
+    for ax in axes_flat[n_agents:]:
+        ax.axis('off')
+
+    # 8) Shared legend below all
+    total_students = env.total_students
+    allowed_vals = np.linspace(0, total_students, num_actions).astype(int)
+    action_patches = [
+        mpatches.Patch(color=action_colors[a], label=f"{allowed_vals[a]} students")
+        for a in range(num_actions)
+    ]
+
+    # leave room for legend
+    fig.subplots_adjust(bottom=0.15, hspace=0.4)
+    fig.legend(
+        handles=action_patches,
+        loc='lower center',
+        ncol=num_actions,
+        title="Color → action",
+        bbox_to_anchor=(0.5, 0.05),
+        frameon=False
+    )
+
+    # 9) Title & layout
+    title_suffix = f" (swap policy: {swap_policy_agent})" if swap_policy_agent else ""
+    fig.suptitle(f"{method}-CTDE Policy Map (γ={gamma:.2f}){title_suffix}", fontsize=16)
+    plt.tight_layout(rect=[0, 0.15, 1, 0.95])
+
+    # 10) Save and close
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    plt.savefig(save_path)
+    plt.close(fig)
+    print(f"Saved policy visualization to {save_path}")
+
+    return save_path
+
 
 def visualize_all_states_centralized(
     method,
@@ -270,7 +420,7 @@ def visualize_all_states_centralized(
         baseline_state = (int(max_inf/2), float((min_risk+max_risk)/2))
 
     # Figure
-    fig, axes = plt.subplots(nrows, ncols, figsize=(5*ncols, 5*nrows), squeeze=False)
+    fig, axes = plt.subplots(nrows, ncols, figsize=(5*ncols, 5*nrows), squeeze=False, sharex=True, sharey=True)
     axes_flat = axes.flatten()
 
     for idx, ag in enumerate(agents):
@@ -314,12 +464,12 @@ def visualize_all_states_centralized(
         mpatches.Patch(color=action_colors[i], label=f"{allowed_vals[i]} students")
         for i in range(num_actions)
     ]
-    fig.subplots_adjust(bottom=0.15, hspace=0.4)
+    fig.subplots_adjust(left=0.05, right=0.97, bottom=0.15, hspace=0.4, wspace=0.15)
     fig.legend(handles=patches, loc='lower center', ncol=num_actions,
                title="Color → action", frameon=False)
 
     # Title with gamma
-    fig.suptitle(f"{method}-Centralized Q‐Policy Marginals (γ = {gamma:.2f})", fontsize=16)
+    fig.suptitle(f"CTCE-{method}Joint Q‐Policy: (weight = {gamma:.2f})", fontsize=16)
 
     plt.tight_layout(rect=[0,0.15,1,0.95])
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
@@ -639,7 +789,7 @@ def visualize_myopic_policy(
     )
 
     # 9) Title & layout
-    fig.suptitle(f"Myopic Policy Maps (γ={gamma:.2f})", fontsize=16)
+    fig.suptitle(f"Myopic Policy (w={gamma:.2f} (shared: 0.6)", fontsize=16)
     plt.tight_layout(rect=[0, 0.15, 1, 0.95])
 
     # 10) Save and close
