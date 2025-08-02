@@ -10,3 +10,11 @@ Exp3
 analysis
 hyperparameter_analysis
 model_behavior
+# ignore all Python byte-cache folders
+__pycache__/
+*.py[cod]
+
+# ignore your experiment results
+agents/mytopic_exp_results/
+
+

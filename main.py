@@ -755,14 +755,14 @@ if __name__ == "__main__":
         # 0.1: {"learning_rate": 0.001, "hidden_dim": 128, "hidden_layers": 2},
         # 0.2: {"learning_rate": 0.001, "hidden_dim": 64, "hidden_layers": 2},
         # 0.3: {"learning_rate": 0.001, "hidden_dim": 64, "hidden_layers": 2},
-        0.4: {"learning_rate": 0.001, "hidden_dim": 128, "hidden_layers": 3},
+        0.4: {"learning_rate": 0.0001, "hidden_dim": 64, "hidden_layers": 3},
         # 0.5: {"learning_rate": 0.001, "hidden_dim": 64, "hidden_layers": 3},
         # 0.6: {"learning_rate": 0.01, "hidden_dim": 64, "hidden_layers": 2},
     }
 
     total_students_list = [100]
     num_classrooms_list = [2]
-    action_levels_list = [3]
+    action_levels_list = [5]
     alphas = [0.0]
     num_seeds = 10
     max_steps = 73
@@ -772,8 +772,8 @@ if __name__ == "__main__":
         for num_classrooms in num_classrooms_list:
             for action_levels in action_levels_list:
                 out_dir = (
-                    f"./results/centralized_mc/"
-                    f"all_gamma_ts{total_students}_nc{num_classrooms}_al{action_levels}_sf{0.6}"
+                    f"./results/centralized_td/"
+                    f"all_gamma_ts{total_students}_nc{num_classrooms}_al{action_levels}"
                 )
                 os.makedirs(out_dir, exist_ok=True)
 
