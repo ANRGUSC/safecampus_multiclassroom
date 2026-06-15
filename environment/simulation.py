@@ -4,21 +4,23 @@ SEED = 42
 np.random.seed(SEED)
 
 
-def simulate_infections_n_classrooms(n_classes, alpha_m, beta, delta, current_infected, allowed_students,
-                                     community_risk):
+def simulate_infections_n_classrooms(n_classes, alpha_m, beta, current_infected, allowed_students,
+                                     community_risk, shared_student_fraction=0.3):
     """
     Updated simulation function.
     For each classroom i:
 
     I(i) = alpha_m[i] * current_infected[i] * allowed_students[i]
            + beta[i] * community_risk[i] * allowed_students[i]^2
-           + delta * shared_students * p_i
+           + shared_students * p_i
 
     where:
       - shared_students = int(allowed_students[i] * shared_student_fraction)
       - p_i is the average infection proportion in the other classrooms.
+
+    The cross-classroom coupling strength is the shared-student fraction f itself
+    (the former separate transmission rate phi/delta has been removed).
     """
-    shared_student_fraction = 0.3
     new_infected = []
     for i in range(n_classes):
         current_inf = current_infected[i]
@@ -45,7 +47,7 @@ def simulate_infections_n_classrooms(n_classes, alpha_m, beta, delta, current_in
         shared_students = int(allowed * shared_student_fraction)
 
         # Cross-classroom infections using the population game formulation
-        cross_class_term = delta * shared_students * avg_prop
+        cross_class_term = shared_students * avg_prop
 
         total_infected = in_class_term + community_term + cross_class_term
 

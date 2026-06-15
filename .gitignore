@@ -21,6 +21,7 @@ env/
 # Data files
 *.csv
 *.json
+*.docx
 
 # Plots and visualizations
 *.png

@@ -1,12 +1,12 @@
 """
 MAPPO CTDE (Centralized Training, Decentralized Execution) for Multi-Classroom Epidemic Control
 
-This version uses a Beta distribution policy instead of Gaussian.
-Beta distribution is naturally bounded to [0, 1], making it ideal for bounded action spaces.
+This implementation supports multiple policy types for continuous action spaces:
 
 Policy options:
-- Beta distribution: Naturally bounded, no clipping needed
-- Tanh-deterministic: Deterministic policy with tanh squashing
+- Gaussian: Standard MAPPO with Gaussian distribution - most common in literature
+- Beta: Beta distribution naturally bounded to [0, 1] - no clipping needed
+- Tanh: Deterministic policy with tanh squashing and exploration noise
 
 Author: SafeCampus Project
 """
@@ -32,12 +32,12 @@ from environment.multiclassroom import MultiClassroomEnv
 GLOBAL_SEED = 42
 OUTPUT_DIR = "mappo_results"
 MODEL_DIR = os.path.join(OUTPUT_DIR, "models")
-LR_FILE = os.path.join(OUTPUT_DIR, "optimized_lrs.json")
+HYPERPARAMS_FILE = os.path.join(OUTPUT_DIR, "optimized_hyperparams.json")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 os.makedirs(MODEL_DIR, exist_ok=True)
 
 # Training Hyperparameters
-GAMMA_DISCOUNT = 0.8
+GAMMA_DISCOUNT = 0.99
 GAE_LAMBDA = 0.95
 K_EPOCHS = 20
 EPS_CLIP = 0.2
@@ -45,18 +45,19 @@ MAX_WEEKS = 15
 UPDATE_TIMESTEP = 2000
 FULL_EPISODES = 3000
 TUNE_EPISODES = 3000
-LR_CANDIDATES = [0.0001, 0.0003, 0.001, 0.003, 0.01, 0.1]
+LR_CANDIDATES = [0.0001, 0.0003, 0.001, 0.003, 0.005, 0.01]
+HIDDEN_DIM_CANDIDATES = [32, 64, 128]
 
 # Omega (Preference) - The weight 'gamma' in the environment
 OMEGA_VALUES = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6]
 
 # Environment Settings
-TOTAL_STUDENTS = 100
+TOTAL_STUDENTS = 50
 NUM_CLASSROOMS = 2
 COOPERATIVE_REWARD = True
 TUNE_SEED = 123
 
-# Monotonicity Evaluation Config
+# Policy Grid Config (for policy heatmap plots)
 POLICY_GRID_POINTS = 20
 
 # Network Architecture Config
@@ -224,10 +225,10 @@ class BetaActor(nn.Module):
 class TanhDeterministicActor(nn.Module):
     """
     Deterministic Actor with Tanh output squashing.
-    
+
     This is a simpler alternative that outputs deterministic actions
     bounded by tanh to [-1, 1], then scaled to [0, 1].
-    
+
     For exploration during training, we add noise externally.
     """
 
@@ -238,7 +239,7 @@ class TanhDeterministicActor(nn.Module):
         self.action_dim = action_dim
         self.hidden_dim = hidden_dim
         self.num_layers = num_layers
-        
+
         # Exploration noise std (decays during training)
         self.noise_std = 0.3
 
@@ -251,13 +252,13 @@ class TanhDeterministicActor(nn.Module):
             layers.append(nn.Tanh())
         layers.append(init_layer(nn.Linear(hidden_dim, action_dim), std=0.01))
         layers.append(nn.Tanh())  # Bound to [-1, 1]
-        
+
         self.network = nn.Sequential(*layers)
 
     def forward(self, state):
         """
         Forward pass returning action in [0, 1].
-        
+
         Tanh outputs [-1, 1], we scale to [0, 1].
         """
         tanh_out = self.network(state)  # [-1, 1]
@@ -267,48 +268,160 @@ class TanhDeterministicActor(nn.Module):
     def act(self, state, add_noise=True):
         """
         Get action with optional exploration noise.
-        
+
         Returns:
             action: Action in [0, 1]
             log_prob: Dummy log_prob (not used in deterministic policy)
         """
         action = self.forward(state)
-        
+
         if add_noise and self.noise_std > 0:
             noise = torch.randn_like(action) * self.noise_std
             action = action + noise
             action = torch.clamp(action, 0.0, 1.0)
-        
+
         # Return dummy log_prob for compatibility
         log_prob = torch.zeros(action.shape[0], device=action.device)
-        
+
         return action.detach(), log_prob.detach()
 
     def evaluate(self, state, action):
         """
         For deterministic policy, we use a pseudo-likelihood.
-        
+
         Returns MSE-based pseudo log probability and zero entropy.
         """
         predicted_action = self.forward(state)
-        
+
         # Pseudo log-prob based on squared error (for PPO compatibility)
         mse = ((predicted_action - action) ** 2).sum(dim=-1)
         pseudo_log_prob = -mse / (2 * self.noise_std ** 2)
-        
+
         # No entropy for deterministic policy
         entropy = torch.zeros_like(pseudo_log_prob)
-        
+
         return pseudo_log_prob, entropy
 
     def get_deterministic_action(self, state):
         """Get deterministic action for evaluation."""
         with torch.no_grad():
             return self.forward(state)
-    
+
     def decay_noise(self, decay_rate=0.995, min_noise=0.05):
         """Decay exploration noise."""
         self.noise_std = max(self.noise_std * decay_rate, min_noise)
+
+
+class GaussianActor(nn.Module):
+    """
+    Standard Gaussian Actor for MAPPO (most common in literature).
+
+    Outputs mean and log_std for a Gaussian distribution over actions.
+    Actions are sampled from N(mean, std) and then clipped to [0, 1].
+
+    This is the standard approach used in most MAPPO papers.
+    """
+
+    def __init__(self, state_dim, action_dim, hidden_dim=64, num_layers=2):
+        super(GaussianActor, self).__init__()
+
+        self.state_dim = state_dim
+        self.action_dim = action_dim
+        self.hidden_dim = hidden_dim
+        self.num_layers = num_layers
+
+        # Shared feature extractor
+        layers = []
+        layers.append(init_layer(nn.Linear(state_dim, hidden_dim)))
+        layers.append(nn.Tanh())
+        for _ in range(num_layers - 1):
+            layers.append(init_layer(nn.Linear(hidden_dim, hidden_dim)))
+            layers.append(nn.Tanh())
+
+        self.feature_net = nn.Sequential(*layers)
+
+        # Mean head
+        self.mean_head = init_layer(nn.Linear(hidden_dim, action_dim), std=0.01)
+
+        # Log std as learnable parameter (shared across all actions)
+        self.log_std = nn.Parameter(torch.zeros(1, action_dim))
+
+    def forward(self, state):
+        """
+        Forward pass returning mean and std.
+
+        Returns:
+            mean: Mean of Gaussian distribution
+            std: Standard deviation (> 0)
+        """
+        features = self.feature_net(state)
+        mean = self.mean_head(features)
+
+        # Apply sigmoid to bound mean to [0, 1]
+        mean = torch.sigmoid(mean)
+
+        # Ensure std is positive and not too small
+        std = torch.exp(self.log_std).expand_as(mean)
+        std = torch.clamp(std, min=1e-6)
+
+        return mean, std
+
+    def act(self, state):
+        """
+        Sample action from Gaussian distribution.
+
+        Returns:
+            action: Sampled action in [0, 1]
+            log_prob: Log probability of the action
+        """
+        mean, std = self.forward(state)
+
+        # Create Gaussian distribution
+        dist = torch.distributions.Normal(mean, std)
+
+        # Sample action
+        action = dist.sample()
+
+        # Clip to [0, 1] for bounded action space
+        action = torch.clamp(action, 0.0, 1.0)
+
+        # Compute log probability
+        log_prob = dist.log_prob(action).sum(dim=-1)
+
+        return action.detach(), log_prob.detach()
+
+    def evaluate(self, state, action):
+        """
+        Evaluate log probability and entropy for given state-action pairs.
+
+        Args:
+            state: Batch of states
+            action: Batch of actions
+
+        Returns:
+            log_prob: Log probabilities
+            entropy: Distribution entropy
+        """
+        mean, std = self.forward(state)
+
+        # Create Gaussian distribution
+        dist = torch.distributions.Normal(mean, std)
+
+        # Compute log probability (before clipping)
+        # Note: This is an approximation since we clip actions to [0,1]
+        # but compute log_prob as if they're unbounded
+        log_prob = dist.log_prob(action).sum(dim=-1)
+
+        # Compute entropy
+        entropy = dist.entropy().sum(dim=-1)
+
+        return log_prob, entropy
+
+    def get_deterministic_action(self, state):
+        """Get deterministic action (mean) for evaluation."""
+        with torch.no_grad():
+            mean, _ = self.forward(state)
+            return mean
 
 
 class CentralizedCritic(nn.Module):
@@ -368,12 +481,12 @@ class MAPPO_CTDE:
     - At execution time, each agent only uses its local actor with local observations
     """
 
-    def __init__(self, num_agents, state_dim, global_state_dim, action_dim, 
+    def __init__(self, num_agents, state_dim, global_state_dim, action_dim,
                  lr_actor, lr_critic,
                  actor_hidden_dim=64, critic_hidden_dim=64,
                  actor_num_layers=2, critic_num_layers=2,
-                 policy_type='beta'):  # 'beta' or 'tanh'
-        
+                 policy_type='gaussian'):
+
         self.num_agents = num_agents
         self.state_dim = state_dim
         self.global_state_dim = global_state_dim
@@ -396,8 +509,10 @@ class MAPPO_CTDE:
             ActorClass = BetaActor
         elif policy_type == 'tanh':
             ActorClass = TanhDeterministicActor
+        elif policy_type == 'gaussian':
+            ActorClass = GaussianActor
         else:
-            raise ValueError(f"Unknown policy type: {policy_type}")
+            raise ValueError(f"Unknown policy type: {policy_type}. Choose from: 'beta', 'tanh', 'gaussian'")
 
         # Decentralized actors - one per agent
         self.actors = [
@@ -538,6 +653,8 @@ class MAPPO_CTDE:
         if self.policy_type == 'tanh':
             for actor in self.actors:
                 actor.decay_noise()
+            for actor in self.actors_old:
+                actor.noise_std = self.actors[0].noise_std
 
         # Clear buffers
         for buffer in buffers.values():
@@ -599,7 +716,7 @@ class MAPPO_CTDE:
             critic_hidden_dim=config['critic_hidden_dim'],
             actor_num_layers=config['actor_num_layers'],
             critic_num_layers=config['critic_num_layers'],
-            policy_type=config.get('policy_type', 'beta'),
+            policy_type=config.get('policy_type', 'gaussian'),
         )
 
         for i, state_dict in enumerate(checkpoint['actors']):
@@ -620,11 +737,12 @@ class MAPPO_CTDE:
 # 3. TRAINING LOGIC
 # ============================================================
 
-def run_marl_session(omega, seed, lr, episodes, num_classrooms=NUM_CLASSROOMS, 
-                     policy_type='beta'):
+def run_marl_session(omega, seed, lr, episodes, num_classrooms=NUM_CLASSROOMS,
+                     policy_type='gaussian', actor_hidden_dim=ACTOR_HIDDEN_DIM,
+                     critic_hidden_dim=CRITIC_HIDDEN_DIM):
     """Runs a single MAPPO CTDE training session."""
     set_seed(seed)
-    
+
     env = MultiClassroomEnv(
         num_classrooms=num_classrooms,
         total_students=TOTAL_STUDENTS,
@@ -645,8 +763,8 @@ def run_marl_session(omega, seed, lr, episodes, num_classrooms=NUM_CLASSROOMS,
         action_dim=1,
         lr_actor=lr,
         lr_critic=lr,
-        actor_hidden_dim=ACTOR_HIDDEN_DIM,
-        critic_hidden_dim=CRITIC_HIDDEN_DIM,
+        actor_hidden_dim=actor_hidden_dim,
+        critic_hidden_dim=critic_hidden_dim,
         actor_num_layers=ACTOR_NUM_LAYERS,
         critic_num_layers=CRITIC_NUM_LAYERS,
         policy_type=policy_type
@@ -721,10 +839,10 @@ def run_marl_session(omega, seed, lr, episodes, num_classrooms=NUM_CLASSROOMS,
 
 
 # ============================================================
-# 4. MONOTONICITY EVALUATION FUNCTIONS
+# 4. POLICY EXTRACTION FUNCTIONS
 # ============================================================
 
-def extract_policy_grid(mappo_agent, agent_idx=0, total_students=TOTAL_STUDENTS, 
+def extract_policy_grid(mappo_agent, agent_idx=0, total_students=TOTAL_STUDENTS,
                         grid_points=POLICY_GRID_POINTS):
     """Extracts a policy grid from a specific agent's actor."""
     infected_vals = np.linspace(0, total_students, grid_points)
@@ -742,102 +860,6 @@ def extract_policy_grid(mappo_agent, agent_idx=0, total_students=TOTAL_STUDENTS,
 
     return policy_grid
 
-
-def evaluate_dominance_monotonicity(policy_grid):
-    """Evaluates policy monotonicity using dominance ordering."""
-    I, J = policy_grid.shape
-
-    violations = 0
-    total_comparisons = 0
-    violation_examples = []
-
-    for i1 in range(I):
-        for j1 in range(J):
-            for i2 in range(i1, I):
-                for j2 in range(j1, J):
-                    if i1 == i2 and j1 == j2:
-                        continue
-
-                    total_comparisons += 1
-
-                    if policy_grid[i2, j2] > policy_grid[i1, j1] + 1e-6:
-                        violations += 1
-                        if len(violation_examples) < 5:
-                            violation_examples.append({
-                                'better_state': (i1, j1),
-                                'worse_state': (i2, j2),
-                                'better_action': float(policy_grid[i1, j1]),
-                                'worse_action': float(policy_grid[i2, j2])
-                            })
-
-    score = (total_comparisons - violations) / total_comparisons if total_comparisons > 0 else 1.0
-
-    details = {
-        'violations': violations,
-        'total_comparisons': total_comparisons,
-        'violation_rate': violations / total_comparisons if total_comparisons > 0 else 0.0,
-        'violation_examples': violation_examples
-    }
-
-    return score, details
-
-
-def evaluate_adjacent_monotonicity(policy_grid):
-    """Adjacent-cell monotonicity check."""
-    I, J = policy_grid.shape
-
-    violations_inf = 0
-    violations_risk = 0
-
-    for j in range(J):
-        for i in range(I - 1):
-            if policy_grid[i + 1, j] > policy_grid[i, j] + 1e-6:
-                violations_inf += 1
-
-    for i in range(I):
-        for j in range(J - 1):
-            if policy_grid[i, j + 1] > policy_grid[i, j] + 1e-6:
-                violations_risk += 1
-
-    total_inf_transitions = J * (I - 1)
-    total_risk_transitions = I * (J - 1)
-    total_transitions = total_inf_transitions + total_risk_transitions
-    total_violations = violations_inf + violations_risk
-
-    score = (total_transitions - total_violations) / total_transitions if total_transitions > 0 else 1.0
-
-    details = {
-        'infected_violations': violations_inf,
-        'risk_violations': violations_risk,
-        'total_violations': total_violations,
-        'total_transitions': total_transitions
-    }
-
-    return score, details
-
-
-def compute_action_diversity(policy_grid, num_bins=10):
-    """Computes action diversity metrics."""
-    flat_actions = policy_grid.flatten()
-
-    bins = np.linspace(0, 1, num_bins + 1)
-    binned_actions = np.digitize(flat_actions, bins) - 1
-    binned_actions = np.clip(binned_actions, 0, num_bins - 1)
-
-    unique_bins = np.unique(binned_actions)
-    num_unique_bins = len(unique_bins)
-
-    action_range = np.max(flat_actions) - np.min(flat_actions)
-    action_std = np.std(flat_actions)
-
-    return {
-        'num_unique_bins': num_unique_bins,
-        'unique_bins': [int(b) for b in unique_bins],
-        'action_range': float(action_range),
-        'action_std': float(action_std),
-        'action_min': float(np.min(flat_actions)),
-        'action_max': float(np.max(flat_actions))
-    }
 
 
 # ============================================================
@@ -860,8 +882,7 @@ def evaluate_tuning_agents(omega_val, mappo_agent, eval_seeds):
             gamma=omega_val,
             continuous_action=True,
             cooperative_reward=COOPERATIVE_REWARD,
-            eval_mode=True,
-            community_risk_data_file="weekly_risk_sample_b.csv"
+            eval_mode=False,
         )
 
         agent_ids = sorted(eval_env.agents)
@@ -896,40 +917,27 @@ def evaluate_tuning_agents(omega_val, mappo_agent, eval_seeds):
     return np.mean(total_rewards)
 
 
-def select_best_lr(omega_results):
-    """Selects the best LR based on monotonicity violations and reward."""
+def select_best_hyperparams(omega_results):
+    """Selects the best hyperparameters based on reward."""
     if not omega_results:
         raise ValueError("No results to select from")
 
-    sorted_results = sorted(
-        omega_results,
-        key=lambda r: (
-            r['dominance_violations'],
-            -r['avg_eval_reward'],
-            -r['num_unique_bins']
-        )
-    )
+    sorted_results = sorted(omega_results, key=lambda r: -r['avg_eval_reward'])
 
     best_metrics = sorted_results[0]
     best_lr = best_metrics['lr']
+    best_hidden_dim = best_metrics['hidden_dim']
 
-    min_violations = best_metrics['dominance_violations']
-    tied_candidates = [r for r in sorted_results if r['dominance_violations'] == min_violations]
-
-    selection_info = {
-        'min_violations': min_violations,
-        'num_tied': len(tied_candidates),
-    }
-
-    return best_lr, best_metrics, selection_info
+    return (best_lr, best_hidden_dim), best_metrics, {}
 
 
-def grid_search_tuning(policy_type='beta'):
+def grid_search_tuning(policy_type='gaussian'):
     """Performs grid search tuning for each omega value."""
-    optimized_lrs = {}
+    optimized_hyperparams = {}
 
     print(f"\n--- Starting Grid Search Hyperparameter Tuning ({policy_type} policy) ---")
     print(f"Testing LRs: {LR_CANDIDATES}")
+    print(f"Testing Hidden Dims: {HIDDEN_DIM_CANDIDATES}")
     start_time = time.time()
 
     for omega in OMEGA_VALUES:
@@ -940,87 +948,71 @@ def grid_search_tuning(policy_type='beta'):
         omega_results = []
 
         for lr in LR_CANDIDATES:
-            print(f"\n  Testing LR={lr:.6f}...")
+            for hidden_dim in HIDDEN_DIM_CANDIDATES:
+                print(f"\n  Testing LR={lr:.6f}, Hidden Dim={hidden_dim}...")
 
-            mappo, history = run_marl_session(omega, TUNE_SEED, lr, TUNE_EPISODES, 
-                                              policy_type=policy_type)
+                mappo, history = run_marl_session(omega, TUNE_SEED, lr, TUNE_EPISODES,
+                                                  policy_type=policy_type,
+                                                  actor_hidden_dim=hidden_dim,
+                                                  critic_hidden_dim=hidden_dim)
 
-            avg_reward = evaluate_tuning_agents(omega, mappo, TUNE_EVAL_SEEDS)
+                avg_reward = evaluate_tuning_agents(omega, mappo, TUNE_EVAL_SEEDS)
 
-            # Aggregate monotonicity across all agents
-            total_dom_violations = 0
-            total_unique_bins = 0
-            total_action_range = 0
+                result = {
+                    'lr': lr,
+                    'hidden_dim': hidden_dim,
+                    'avg_eval_reward': avg_reward,
+                }
+                omega_results.append(result)
 
-            for agent_idx in range(mappo.num_agents):
-                policy_grid = extract_policy_grid(mappo, agent_idx)
-                dom_score, dom_details = evaluate_dominance_monotonicity(policy_grid)
-                diversity = compute_action_diversity(policy_grid)
+                print(f"    Reward: {avg_reward:.2f}")
 
-                total_dom_violations += dom_details['violations']
-                total_unique_bins += diversity['num_unique_bins']
-                total_action_range += diversity['action_range']
+        best_hyperparams, best_metrics, _ = select_best_hyperparams(omega_results)
+        best_lr, best_hidden_dim = best_hyperparams
+        optimized_hyperparams[str(omega)] = {'lr': best_lr, 'hidden_dim': best_hidden_dim}
 
-            avg_unique_bins = total_unique_bins / mappo.num_agents
-            avg_action_range = total_action_range / mappo.num_agents
+        print(f"\n  --> Best LR for Omega={omega}: {best_lr}, Best Hidden Dim: {best_hidden_dim}")
+        print(f"      Reward: {best_metrics['avg_eval_reward']:.2f}")
 
-            result = {
-                'lr': lr,
-                'avg_eval_reward': avg_reward,
-                'dominance_violations': total_dom_violations,
-                'num_unique_bins': avg_unique_bins,
-                'action_range': avg_action_range
-            }
-            omega_results.append(result)
-
-            print(f"    Reward: {avg_reward:.2f}, Violations: {total_dom_violations}, "
-                  f"Diversity: {avg_unique_bins:.1f} bins")
-
-        best_lr, best_metrics, selection_info = select_best_lr(omega_results)
-        optimized_lrs[str(omega)] = best_lr
-
-        print(f"\n  --> Best LR for Omega={omega}: {best_lr}")
-        print(f"      Violations: {best_metrics['dominance_violations']}, "
-              f"Reward: {best_metrics['avg_eval_reward']:.2f}")
-
-    with open(LR_FILE, 'w') as f:
-        json.dump(optimized_lrs, f, indent=4)
+    with open(HYPERPARAMS_FILE, 'w') as f:
+        json.dump(optimized_hyperparams, f, indent=4)
 
     elapsed = time.time() - start_time
     print(f"\nTuning complete in {elapsed / 60:.1f} minutes")
-    print(f"Optimized LRs saved to {LR_FILE}")
+    print(f"Optimized hyperparameters saved to {HYPERPARAMS_FILE}")
 
-    return {float(k): v for k, v in optimized_lrs.items()}
+    return {float(k): v for k, v in optimized_hyperparams.items()}
 
 
-def load_lrs():
-    """Load optimized learning rates from file."""
-    if not os.path.exists(LR_FILE):
-        print(f"WARNING: {LR_FILE} not found. Using default LR=0.001")
-        return {omega: 0.001 for omega in OMEGA_VALUES}
+def load_hyperparams():
+    """Load optimized hyperparameters from file."""
+    if not os.path.exists(HYPERPARAMS_FILE):
+        print(f"WARNING: {HYPERPARAMS_FILE} not found. Using default LR=0.001, Hidden Dim=64")
+        return {omega: {'lr': 0.001, 'hidden_dim': 64} for omega in OMEGA_VALUES}
 
-    with open(LR_FILE, 'r') as f:
-        lrs = json.load(f)
+    with open(HYPERPARAMS_FILE, 'r') as f:
+        hyperparams = json.load(f)
 
-    return {float(k): float(v) for k, v in lrs.items()}
+    return {float(k): v for k, v in hyperparams.items()}
 
 
 # ============================================================
 # 6. FULL TRAINING AND EVALUATION
 # ============================================================
 
-def train_and_evaluate_optimal(optimized_lrs, policy_type='beta'):
-    """Runs full training with optimized LRs and saves models."""
-    print(f"\n--- Starting Full Training with Optimal LRs ({policy_type} policy) ---")
+def train_and_evaluate_optimal(optimized_hyperparams, policy_type='gaussian'):
+    """Runs full training with optimized hyperparameters and saves models."""
+    print(f"\n--- Starting Full Training with Optimal Hyperparameters ({policy_type} MAPPO) ---")
 
     all_rewards_matrix = {}
     representative_agents = {}
-    final_monotonicity_scores = {}
 
     for omega in OMEGA_VALUES:
-        lr = optimized_lrs.get(omega, 0.001)
+        hyperparams = optimized_hyperparams.get(omega, {'lr': 0.001, 'hidden_dim': 64})
+        lr = hyperparams['lr']
+        hidden_dim = hyperparams['hidden_dim']
         print(f"\n{'=' * 60}")
-        print(f"*** Training Omega = {omega}, LR = {lr} ***")
+        print(f"*** Training Omega = {omega}, LR = {lr}, Hidden Dim = {hidden_dim} ***")
         print(f"{'=' * 60}")
 
         omega_rewards_runs = []
@@ -1030,61 +1022,27 @@ def train_and_evaluate_optimal(optimized_lrs, policy_type='beta'):
             print(f"\n  Run {run + 1}/{NUM_RUNS} (seed={seed})")
 
             mappo, history = run_marl_session(omega, seed, lr, FULL_EPISODES,
-                                              policy_type=policy_type)
+                                              policy_type=policy_type,
+                                              actor_hidden_dim=hidden_dim,
+                                              critic_hidden_dim=hidden_dim)
             omega_rewards_runs.append(history)
 
             # Save each run's model
-            model_path = os.path.join(MODEL_DIR, f"mappo_omega_{omega}_run_{run}")
+            model_path = os.path.join(MODEL_DIR, f"mappo_omega_{omega}_hd_{hidden_dim}_run_{run}")
             mappo.save(model_path)
 
             if run == 0:
                 representative_agents[omega] = mappo
 
-        # Evaluate final monotonicity
-        total_dom_violations = 0
-        total_adj_violations = 0
-        total_dom_comparisons = 0
-        total_adj_transitions = 0
-
-        for agent_idx in range(representative_agents[omega].num_agents):
-            policy_grid = extract_policy_grid(representative_agents[omega], agent_idx)
-            dom_score, dom_details = evaluate_dominance_monotonicity(policy_grid)
-            adj_score, adj_details = evaluate_adjacent_monotonicity(policy_grid)
-
-            total_dom_violations += dom_details['violations']
-            total_adj_violations += adj_details['total_violations']
-            total_dom_comparisons += dom_details['total_comparisons']
-            total_adj_transitions += adj_details['total_transitions']
-
-        final_dom_score = 1.0 - (total_dom_violations / total_dom_comparisons) if total_dom_comparisons > 0 else 1.0
-        final_adj_score = 1.0 - (total_adj_violations / total_adj_transitions) if total_adj_transitions > 0 else 1.0
-
-        final_monotonicity_scores[omega] = {
-            'dominance_score': final_dom_score,
-            'dominance_violations': total_dom_violations,
-            'adjacent_score': final_adj_score,
-            'adjacent_violations': total_adj_violations
-        }
-
-        print(f"\n  Final Monotonicity for Omega={omega}:")
-        print(f"    Dominance: {final_dom_score:.4f} ({total_dom_violations} violations)")
-        print(f"    Adjacent: {final_adj_score:.4f} ({total_adj_violations} violations)")
-
         all_rewards_matrix[omega] = np.array(omega_rewards_runs)
-
-    # Save monotonicity summary
-    mono_file = os.path.join(OUTPUT_DIR, "final_monotonicity_scores.json")
-    with open(mono_file, 'w') as f:
-        json.dump({str(k): v for k, v in final_monotonicity_scores.items()}, f, indent=4)
 
     # Plot results
     plot_combined_rewards(all_rewards_matrix, NUM_RUNS)
     plot_policy_strips(representative_agents)
-    plot_monotonicity_summary(final_monotonicity_scores)
 
     print(f"\nTraining complete. Models saved to {MODEL_DIR}")
 
-    return representative_agents, final_monotonicity_scores
+    return representative_agents
 
 
 # ============================================================
@@ -1189,79 +1147,44 @@ def plot_policy_strips(representative_agents):
     plt.close()
 
 
-def plot_monotonicity_summary(monotonicity_scores):
-    """Plots monotonicity scores bar chart."""
-    print("\n--- Generating Monotonicity Summary Plot ---")
-
-    omegas = list(monotonicity_scores.keys())
-    dom_scores = [monotonicity_scores[o]['dominance_score'] for o in omegas]
-    adj_scores = [monotonicity_scores[o]['adjacent_score'] for o in omegas]
-
-    x = np.arange(len(omegas))
-    width = 0.35
-
-    fig, ax = plt.subplots(figsize=(10, 5))
-    bars1 = ax.bar(x - width / 2, dom_scores, width, label='Dominance Monotonicity', color='steelblue')
-    bars2 = ax.bar(x + width / 2, adj_scores, width, label='Adjacent Monotonicity', color='coral')
-
-    ax.set_xlabel('Omega ($\\omega$)')
-    ax.set_ylabel('Monotonicity Score')
-    ax.set_title('Policy Monotonicity Scores by Omega (MAPPO CTDE Beta)')
-    ax.set_xticks(x)
-    ax.set_xticklabels([f'{o}' for o in omegas])
-    ax.set_ylim(0, 1.05)
-    ax.legend()
-    ax.axhline(y=1.0, color='green', linestyle='--', alpha=0.5)
-
-    for bar in bars1:
-        height = bar.get_height()
-        ax.annotate(f'{height:.3f}', xy=(bar.get_x() + bar.get_width() / 2, height),
-                    xytext=(0, 3), textcoords="offset points", ha='center', va='bottom', fontsize=9)
-    for bar in bars2:
-        height = bar.get_height()
-        ax.annotate(f'{height:.3f}', xy=(bar.get_x() + bar.get_width() / 2, height),
-                    xytext=(0, 3), textcoords="offset points", ha='center', va='bottom', fontsize=9)
-
-    plt.tight_layout()
-    plt.savefig(os.path.join(OUTPUT_DIR, "monotonicity_summary.png"), dpi=300)
-    plt.close()
-
 
 # ============================================================
 # 8. MAIN CONTROL FUNCTION
 # ============================================================
 
-def main(mode='train', policy_type='beta'):
+def main(mode='train', policy_type='gaussian'):
     """
     Main function to control execution flow.
 
     Modes:
-    - 'tune': Runs Grid Search to find the optimal LR for each omega and saves them.
-    - 'train': Loads optimal LRs and runs full training, evaluation, and plotting.
+    - 'tune': Runs Grid Search to find the optimal hyperparameters (LR and Hidden Dim) for each omega and saves them.
+    - 'train': Loads optimal hyperparameters and runs full training, evaluation, and plotting.
     - 'tune_and_train': Runs tuning, then immediately runs training.
-    
+
     Policy types:
-    - 'beta': Beta distribution (naturally bounded)
-    - 'tanh': Tanh deterministic with noise
+    - 'gaussian': Standard Gaussian policy (most common MAPPO, recommended)
+    - 'beta': Beta distribution (naturally bounded to [0,1])
+    - 'tanh': Tanh deterministic with exploration noise
     """
-    print(f"Policy type: {policy_type}")
-    
-    optimized_lrs = {}
+    print(f"Policy: {policy_type} MAPPO")
+
+    optimized_hyperparams = {}
 
     if mode == 'tune' or mode == 'tune_and_train':
-        optimized_lrs = grid_search_tuning(policy_type=policy_type)
+        optimized_hyperparams = grid_search_tuning(policy_type=policy_type)
     else:
-        optimized_lrs = load_lrs()
+        optimized_hyperparams = load_hyperparams()
 
     if mode == 'train' or mode == 'tune_and_train':
-        train_and_evaluate_optimal(optimized_lrs, policy_type=policy_type)
+        train_and_evaluate_optimal(optimized_hyperparams, policy_type=policy_type)
 
     print(f"\nAll processing complete. Results in {OUTPUT_DIR}")
 
 
 if __name__ == '__main__':
-    # Use Beta distribution by default
-    main(mode='tune_and_train', policy_type='tanh')
-    
-    # To use Tanh deterministic policy instead:
+    # Use Gaussian policy (standard MAPPO) by default
+    main(mode='tune_and_train', policy_type='beta')
+
+    # To use other policies:
+    # main(mode='tune_and_train', policy_type='beta')
     # main(mode='tune_and_train', policy_type='tanh')

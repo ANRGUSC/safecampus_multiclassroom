@@ -10,7 +10,7 @@ import os
 class MultiClassroomEnv(ParallelEnv):
     def __init__(self, num_classrooms=1, total_students=100, max_weeks=15,
                  action_levels_per_class=None, continuous_action=False,
-                 alpha=0.008, beta=0.01, phi=0.2, gamma=0.5, seed=None,
+                 alpha=0.008, beta=0.01, shared_fraction=0.3, gamma=0.5, seed=None,
                  community_risk_data_file=None, eval_mode=False,
                  cooperative_reward=True):
         """
@@ -22,7 +22,8 @@ class MultiClassroomEnv(ParallelEnv):
           continuous_action (bool): If True, actions are continuous [0, total_students]
           alpha (float): Infection rate parameter
           beta (float): Recovery rate parameter
-          phi (float): Cross-classroom transmission rate
+          shared_fraction (float): Fraction of students shared across classrooms
+                                   (the cross-classroom coupling strength)
           gamma (float): Balance weight between allowed students and infections (omega)
           seed (int): Random seed
           community_risk_data_file (str): Path to risk data CSV (optional)
@@ -32,7 +33,7 @@ class MultiClassroomEnv(ParallelEnv):
         self.num_classrooms = num_classrooms
         self.total_students = total_students
         self.max_weeks = max_weeks
-        self.phi = phi
+        self.shared_fraction = shared_fraction
         self.gamma = gamma
         self.current_week = 0
         self.continuous_action = continuous_action
@@ -78,11 +79,24 @@ class MultiClassroomEnv(ParallelEnv):
         self.student_status = [0] * self.num_classrooms
         self.allowed_students = [0] * self.num_classrooms
 
-        # Risk Data Loading
+        # Risk Data Loading: parse a weekly community-risk series from CSV.
+        # Expected columns: a 'Risk-Level' column (0-1); falls back to the last
+        # numeric column. Stored as a list of floats; applied only when passed to
+        # reset() via risk_override (kept out of the training path).
         self.community_risk_data = []
         if community_risk_data_file and os.path.exists(community_risk_data_file):
-            # Load CSV logic here if needed, for now we simulate risk
-            pass
+            import csv as _csv
+            try:
+                with open(community_risk_data_file, 'r') as f:
+                    rows = list(_csv.DictReader(f))
+                if rows:
+                    fields = rows[0].keys()
+                    risk_col = next((c for c in fields if 'risk' in c.lower()), None)
+                    if risk_col is None:
+                        risk_col = list(fields)[-1]
+                    self.community_risk_data = [float(r[risk_col]) for r in rows]
+            except (ValueError, KeyError, OSError):
+                self.community_risk_data = []
 
         if seed is not None:
             self.seed(seed)
@@ -91,14 +105,28 @@ class MultiClassroomEnv(ParallelEnv):
         np.random.seed(seed)
         random.seed(seed)
 
-    def _generate_shared_episode_risk(self):
-        # Generate a random risk curve for the episode
-        length = self.max_weeks + 5
-        base_risk = np.random.uniform(0.1, 0.5)
-        trend = np.linspace(0, np.random.uniform(-0.2, 0.4), length)
-        noise = np.random.normal(0, 0.05, length)
-        risk = np.clip(base_risk + trend + noise, 0.0, 1.0)
-        return risk
+    def _generate_risk_pattern(self, episode_seed):
+        # Local RNG for risk pattern generation ensures consistency per episode index
+        rng = np.random.default_rng(episode_seed)
+
+        t = np.linspace(0, 2 * np.pi, self.max_weeks)
+        risk = np.zeros(self.max_weeks)
+
+        num_components = rng.integers(1, 4)
+        for _ in range(num_components):
+            amp = rng.uniform(0.2, 0.4)
+            freq = rng.uniform(0.5, 2.0)
+            phase = rng.uniform(0, 2 * np.pi)
+            risk += amp * np.sin(freq * t + phase)
+
+        # normalize to exactly [0.0, 1.0]
+        r_min, r_max = risk.min(), risk.max()
+        if r_max - r_min > 1e-6:
+            risk = (risk - r_min) / (r_max - r_min)
+        else:
+            risk = np.zeros_like(risk)
+
+        return risk.tolist()
 
     def set_mode(self, eval_mode):
         self.eval_mode = eval_mode
@@ -152,10 +180,10 @@ class MultiClassroomEnv(ParallelEnv):
             self.num_classrooms,
             self.alpha_m,
             self.beta,
-            self.phi,
             self.student_status,
             self.allowed_students,
-            [risk] * self.num_classrooms
+            [risk] * self.num_classrooms,
+            shared_student_fraction=self.shared_fraction
         )
 
         # --- REWARD CALCULATION ---
@@ -184,7 +212,15 @@ class MultiClassroomEnv(ParallelEnv):
 
         return self._get_observations(), rewards, dones, {}
 
-    def reset(self, seed=None, options=None):
+    def reset(self, seed=None, options=None, risk_override=None):
+        """Reset the episode.
+
+        risk_override: optional explicit weekly community-risk vector. When given,
+        the initial infections are still randomized from `seed`, but the risk
+        trajectory is fixed to this vector (used to evaluate on a held-out / real
+        risk series while still sampling initial conditions). Requires
+        eval_mode=False so the env reads `shared_community_risk`.
+        """
         if seed is not None:
             self.seed(seed)
 
@@ -192,8 +228,12 @@ class MultiClassroomEnv(ParallelEnv):
         self.allowed_students = [0] * self.num_classrooms
         self.current_week = 0
 
-        if not self.eval_mode:
-            self.shared_community_risk = self._generate_shared_episode_risk()
+        if risk_override is not None:
+            self.shared_community_risk = [float(r) for r in risk_override]
+        elif not self.eval_mode:
+            # Reproducible per-episode risk when a seed is supplied; random otherwise
+            episode_seed = seed if seed is not None else int(np.random.randint(0, 2 ** 31 - 1))
+            self.shared_community_risk = self._generate_risk_pattern(episode_seed)
 
         return self._get_observations()
 

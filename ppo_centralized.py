@@ -4,10 +4,11 @@ Centralized PPO for Multi-Classroom Epidemic Control
 A single central controller observes the global state (all classrooms' infected counts + risk)
 and outputs actions for all classrooms simultaneously.
 
-This version uses TanhDeterministicActor (same as CTDE) for consistency.
-- Deterministic policy with tanh output scaled to [0, 1]
-- Exploration via decaying Gaussian noise
-- Pseudo log-prob for PPO compatibility
+This version uses Beta policy (proper PPO):
+- Stochastic policy with Beta distribution
+- Actions naturally bounded to [0, 1] (no clipping!)
+- Natural exploration through sampling
+- Proper log probabilities for PPO
 
 Author: SafeCampus Project
 """
@@ -21,8 +22,6 @@ import os
 import json
 import random
 import time
-from matplotlib.colors import LinearSegmentedColormap
-import colorsys
 
 from environment.multiclassroom import MultiClassroomEnv
 
@@ -32,12 +31,12 @@ from environment.multiclassroom import MultiClassroomEnv
 GLOBAL_SEED = 42
 OUTPUT_DIR = "centralized_ppo_results"
 MODEL_DIR = os.path.join(OUTPUT_DIR, "models")
-LR_FILE = os.path.join(OUTPUT_DIR, "optimized_lrs.json")
+HYPERPARAMS_FILE = os.path.join(OUTPUT_DIR, "optimized_hyperparams.json")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 os.makedirs(MODEL_DIR, exist_ok=True)
 
 # Training Hyperparameters
-GAMMA_DISCOUNT = 0.8
+GAMMA_DISCOUNT = 0.99
 GAE_LAMBDA = 0.95
 K_EPOCHS = 20
 EPS_CLIP = 0.2
@@ -46,12 +45,13 @@ UPDATE_TIMESTEP = 2000
 FULL_EPISODES = 3000
 TUNE_EPISODES = 3000
 LR_CANDIDATES = [0.0001, 0.0003, 0.001, 0.003, 0.005, 0.01]
+HIDDEN_DIM_CANDIDATES = [32, 64, 128]
 
 # Omega (Preference weight)
 OMEGA_VALUES = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6]
 
 # Environment Settings
-TOTAL_STUDENTS = 100
+TOTAL_STUDENTS = 50
 NUM_CLASSROOMS = 2
 COOPERATIVE_REWARD = True
 TUNE_SEED = 123
@@ -61,7 +61,6 @@ HIDDEN_DIM = 32
 NUM_LAYERS = 2
 
 # Evaluation
-POLICY_GRID_POINTS = 20
 NUM_RUNS = 1
 
 device = torch.device("cpu")
@@ -102,94 +101,112 @@ def init_layer(layer, std=np.sqrt(2), bias_const=0.0):
     return layer
 
 
-class TanhDeterministicActor(nn.Module):
+class BetaActor(nn.Module):
     """
-    Deterministic Actor with Tanh output squashing.
-    
-    This is the SAME architecture used in CTDE for consistency.
-    - Network outputs tanh in [-1, 1], scaled to [0, 1]
-    - Exploration via external Gaussian noise during training
-    - Pseudo log-prob based on MSE for PPO compatibility
+    Beta Actor for standard PPO.
+
+    Outputs alpha and beta parameters for Beta distribution over actions.
+    Beta distribution is naturally bounded to [0, 1] - no clipping needed!
+
+    This is the same approach used in the successful ranking PPO.
     """
 
     def __init__(self, state_dim, action_dim, hidden_dim=64, num_layers=2):
-        super(TanhDeterministicActor, self).__init__()
+        super(BetaActor, self).__init__()
 
         self.state_dim = state_dim
         self.action_dim = action_dim
         self.hidden_dim = hidden_dim
         self.num_layers = num_layers
-        
-        # Exploration noise std (decays during training)
-        self.noise_std = 0.3
 
-        # Build network
+        # Build feature network
         layers = []
         layers.append(init_layer(nn.Linear(state_dim, hidden_dim)))
         layers.append(nn.Tanh())
         for _ in range(num_layers - 1):
             layers.append(init_layer(nn.Linear(hidden_dim, hidden_dim)))
             layers.append(nn.Tanh())
-        layers.append(init_layer(nn.Linear(hidden_dim, action_dim), std=0.01))
-        layers.append(nn.Tanh())  # Bound to [-1, 1]
-        
-        self.network = nn.Sequential(*layers)
+
+        self.feature_net = nn.Sequential(*layers)
+
+        # Alpha and Beta heads for Beta distribution
+        self.alpha_head = init_layer(nn.Linear(hidden_dim, action_dim), std=0.01)
+        self.beta_head = init_layer(nn.Linear(hidden_dim, action_dim), std=0.01)
 
     def forward(self, state):
         """
-        Forward pass returning action in [0, 1].
-        
-        Tanh outputs [-1, 1], we scale to [0, 1].
-        """
-        tanh_out = self.network(state)  # [-1, 1]
-        action = (tanh_out + 1.0) / 2.0  # [0, 1]
-        return action
+        Forward pass returning alpha and beta parameters.
 
-    def act(self, state, add_noise=True):
-        """
-        Get action with optional exploration noise.
-        
         Returns:
-            action: Action in [0, 1]
-            log_prob: Dummy log_prob (not used in deterministic policy)
+            alpha: Alpha parameter (> 0)
+            beta: Beta parameter (> 0)
         """
-        action = self.forward(state)
-        
-        if add_noise and self.noise_std > 0:
-            noise = torch.randn_like(action) * self.noise_std
-            action = action + noise
-            action = torch.clamp(action, 0.0, 1.0)
-        
-        # Return dummy log_prob for compatibility
-        log_prob = torch.zeros(action.shape[0], device=action.device)
-        
+        features = self.feature_net(state)
+
+        # Compute alpha and beta (must be > 0)
+        # Use softplus + 1.0 to ensure alpha, beta > 1 (unimodal distribution)
+        alpha = torch.nn.functional.softplus(self.alpha_head(features)) + 1.0
+        beta = torch.nn.functional.softplus(self.beta_head(features)) + 1.0
+
+        return alpha, beta
+
+    def act(self, state):
+        """
+        Sample action from Beta distribution.
+
+        Returns:
+            action: Sampled action in [0, 1] (naturally bounded!)
+            log_prob: Log probability of the action
+        """
+        alpha, beta = self.forward(state)
+
+        # Create Beta distribution (naturally bounded to [0, 1])
+        dist = torch.distributions.Beta(alpha, beta)
+
+        # Sample action (no clipping needed!)
+        action = dist.sample()
+
+        # Compute log probability
+        log_prob = dist.log_prob(action).sum(dim=-1)
+
         return action.detach(), log_prob.detach()
 
     def evaluate(self, state, action):
         """
-        For deterministic policy, we use a pseudo-likelihood.
-        
-        Returns MSE-based pseudo log probability and zero entropy.
+        Evaluate log probability and entropy for given state-action pairs.
+
+        Args:
+            state: State tensor
+            action: Action tensor (already in [0, 1])
+
+        Returns:
+            log_prob: Log probabilities
+            entropy: Distribution entropy
         """
-        predicted_action = self.forward(state)
-        
-        # Pseudo log-prob based on squared error (for PPO compatibility)
-        mse = ((predicted_action - action) ** 2).sum(dim=-1)
-        pseudo_log_prob = -mse / (2 * self.noise_std ** 2 + 1e-8)
-        
-        # No entropy for deterministic policy
-        entropy = torch.zeros_like(pseudo_log_prob)
-        
-        return pseudo_log_prob, entropy
+        alpha, beta = self.forward(state)
+
+        # Create Beta distribution
+        dist = torch.distributions.Beta(alpha, beta)
+
+        # Compute log probability (valid for any action in [0, 1])
+        log_prob = dist.log_prob(action).sum(dim=-1)
+
+        # Compute entropy
+        entropy = dist.entropy().sum(dim=-1)
+
+        return log_prob, entropy
 
     def get_deterministic_action(self, state):
-        """Get deterministic action for evaluation."""
+        """Get deterministic action (mode of Beta distribution) for evaluation."""
         with torch.no_grad():
-            return self.forward(state)
-    
-    def decay_noise(self, decay_rate=0.995, min_noise=0.05):
-        """Decay exploration noise."""
-        self.noise_std = max(self.noise_std * decay_rate, min_noise)
+            alpha, beta = self.forward(state)
+
+            # Mode of Beta distribution: (alpha - 1) / (alpha + beta - 2)
+            # For alpha, beta > 1, mode is well-defined
+            mode = (alpha - 1) / (alpha + beta - 2)
+            mode = torch.clamp(mode, 0.0, 1.0)
+
+            return mode
 
     # Alias for compatibility with evaluation scripts
     def get_deterministic_actions(self, state):
@@ -245,13 +262,13 @@ class RolloutBuffer:
 class CentralizedPPO:
     """
     Centralized PPO that controls all agents with a single policy.
-    
-    Uses TanhDeterministicActor (same as CTDE) for consistency.
+
+    Uses Beta policy for proper stochastic PPO (naturally bounded actions).
     """
 
-    def __init__(self, global_state_dim, num_actions, lr, 
+    def __init__(self, global_state_dim, num_actions, lr,
                  hidden_dim=64, num_layers=2):
-        
+
         self.global_state_dim = global_state_dim
         self.num_actions = num_actions
         self.lr = lr
@@ -263,12 +280,12 @@ class CentralizedPPO:
         self.eps_clip = EPS_CLIP
         self.K_epochs = K_EPOCHS
 
-        # Actor and Critic networks (TanhDeterministicActor - same as CTDE)
-        self.actor = TanhDeterministicActor(global_state_dim, num_actions, hidden_dim, num_layers).to(device)
+        # Actor and Critic networks (BetaActor for standard PPO)
+        self.actor = BetaActor(global_state_dim, num_actions, hidden_dim, num_layers).to(device)
         self.critic = Critic(global_state_dim, hidden_dim, num_layers).to(device)
-        
+
         # Old actor for PPO ratio computation
-        self.actor_old = TanhDeterministicActor(global_state_dim, num_actions, hidden_dim, num_layers).to(device)
+        self.actor_old = BetaActor(global_state_dim, num_actions, hidden_dim, num_layers).to(device)
         self.actor_old.load_state_dict(self.actor.state_dict())
 
         # Optimizers
@@ -277,21 +294,21 @@ class CentralizedPPO:
 
         self.MseLoss = nn.MSELoss()
 
-    def select_actions(self, global_state, add_noise=True):
+    def select_actions(self, global_state):
         """
-        Select actions with optional exploration noise.
-        
+        Select actions by sampling from Beta policy.
+
         Returns:
             actions: Actions in [0, 1] for each classroom
-            log_prob: Pseudo log probability
+            log_prob: Log probability
             value: Value estimate for the state
         """
         state_tensor = torch.FloatTensor(global_state).unsqueeze(0).to(device)
-        
+
         with torch.no_grad():
-            actions, log_prob = self.actor_old.act(state_tensor, add_noise=add_noise)
+            actions, log_prob = self.actor_old.act(state_tensor)
             value = self.critic(state_tensor)
-        
+
         return actions.squeeze(0).cpu().numpy(), log_prob, value
 
     def update(self, buffer):
@@ -347,13 +364,15 @@ class CentralizedPPO:
             # Clipped surrogate objective
             surr1 = ratios * advantages
             surr2 = torch.clamp(ratios, 1 - self.eps_clip, 1 + self.eps_clip) * advantages
-            
-            # Actor loss (no entropy bonus for deterministic policy)
+
+            # Actor loss with entropy bonus
             actor_loss = -torch.min(surr1, surr2).mean()
+            entropy_loss = -0.01 * entropy.mean()  # Encourage exploration
+            total_actor_loss = actor_loss + entropy_loss
 
             # Update actor
             self.actor_optimizer.zero_grad()
-            actor_loss.backward()
+            total_actor_loss.backward()
             torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 0.5)
             self.actor_optimizer.step()
 
@@ -369,10 +388,6 @@ class CentralizedPPO:
 
         # Sync old policy
         self.actor_old.load_state_dict(self.actor.state_dict())
-        
-        # Decay exploration noise
-        self.actor.decay_noise()
-        self.actor_old.noise_std = self.actor.noise_std
 
         buffer.clear()
 
@@ -392,7 +407,6 @@ class CentralizedPPO:
             'lr': self.lr,
             'hidden_dim': self.hidden_dim,
             'num_layers': self.num_layers,
-            'noise_std': self.actor.noise_std,
         }, path)
         print(f"Model saved to {path}")
 
@@ -417,11 +431,7 @@ class CentralizedPPO:
         ppo.critic.load_state_dict(checkpoint['critic_state_dict'])
         ppo.actor_optimizer.load_state_dict(checkpoint['actor_optimizer_state_dict'])
         ppo.critic_optimizer.load_state_dict(checkpoint['critic_optimizer_state_dict'])
-        
-        if 'noise_std' in checkpoint:
-            ppo.actor.noise_std = checkpoint['noise_std']
-            ppo.actor_old.noise_std = checkpoint['noise_std']
-        
+
         print(f"Model loaded from {path}")
         return ppo
 
@@ -436,7 +446,7 @@ class CentralizedPPO:
 # 4. TRAINING FUNCTIONS
 # ============================================================
 
-def run_centralized_training(omega, seed, lr, episodes, num_classrooms=NUM_CLASSROOMS):
+def run_centralized_training(omega, seed, lr, episodes, num_classrooms=NUM_CLASSROOMS, hidden_dim=HIDDEN_DIM):
     """Run centralized PPO training."""
     set_seed(seed)
 
@@ -457,7 +467,7 @@ def run_centralized_training(omega, seed, lr, episodes, num_classrooms=NUM_CLASS
         global_state_dim=global_state_dim,
         num_actions=num_actions,
         lr=lr,
-        hidden_dim=HIDDEN_DIM,
+        hidden_dim=hidden_dim,
         num_layers=NUM_LAYERS
     )
 
@@ -474,7 +484,7 @@ def run_centralized_training(omega, seed, lr, episodes, num_classrooms=NUM_CLASS
         while not done:
             time_step += 1
 
-            actions_normalized, log_prob, value = ppo.select_actions(global_state, add_noise=True)
+            actions_normalized, log_prob, value = ppo.select_actions(global_state)
 
             actions_env = {
                 aid: np.array([actions_normalized[i] * TOTAL_STUDENTS])
@@ -507,161 +517,24 @@ def run_centralized_training(omega, seed, lr, episodes, num_classrooms=NUM_CLASS
 
 
 # ============================================================
-# 5. POLICY EXTRACTION AND MONOTONICITY EVALUATION
+# 5. HYPERPARAMETER TUNING
 # ============================================================
 
-def extract_centralized_policy_grid(ppo, agent_idx=0, total_students=TOTAL_STUDENTS,
-                                    grid_points=POLICY_GRID_POINTS, other_infected_frac=0.1):
-    """Extract policy grid for a specific agent from centralized controller."""
-    num_classrooms = ppo.num_actions
-    infected_vals = np.linspace(0, total_students, grid_points)
-    risk_vals = np.linspace(0, 1, grid_points)
-
-    other_infected = other_infected_frac * total_students
-
-    policy_grid = np.zeros((grid_points, grid_points), dtype=np.float32)
-
-    for i, inf in enumerate(infected_vals):
-        for j, risk in enumerate(risk_vals):
-            global_state = []
-            for k in range(num_classrooms):
-                if k == agent_idx:
-                    global_state.extend([inf / total_students, risk])
-                else:
-                    global_state.extend([other_infected / total_students, risk])
-            global_state = np.array(global_state, dtype=np.float32)
-
-            state_tensor = torch.FloatTensor(global_state).unsqueeze(0).to(device)
-            with torch.no_grad():
-                actions = ppo.actor.get_deterministic_action(state_tensor)
-                action = actions[0, agent_idx].item()
-
-            policy_grid[i, j] = action
-
-    return policy_grid
-
-
-def extract_joint_policy_grid(ppo, total_students=TOTAL_STUDENTS, grid_points=POLICY_GRID_POINTS):
-    """Extract policy grids for all agents assuming symmetric states."""
-    num_classrooms = ppo.num_actions
-    infected_vals = np.linspace(0, total_students, grid_points)
-    risk_vals = np.linspace(0, 1, grid_points)
-
-    policy_grids = [np.zeros((grid_points, grid_points), dtype=np.float32)
-                   for _ in range(num_classrooms)]
-
-    for i, inf in enumerate(infected_vals):
-        for j, risk in enumerate(risk_vals):
-            global_state = []
-            for k in range(num_classrooms):
-                global_state.extend([inf / total_students, risk])
-            global_state = np.array(global_state, dtype=np.float32)
-
-            state_tensor = torch.FloatTensor(global_state).unsqueeze(0).to(device)
-            with torch.no_grad():
-                actions = ppo.actor.get_deterministic_action(state_tensor)
-
-            for k in range(num_classrooms):
-                policy_grids[k][i, j] = actions[0, k].item()
-
-    return policy_grids
-
-
-def evaluate_dominance_monotonicity(policy_grid):
-    """Evaluate dominance monotonicity of a policy grid."""
-    I, J = policy_grid.shape
-    violations = 0
-    total_comparisons = 0
-
-    for i1 in range(I):
-        for j1 in range(J):
-            for i2 in range(i1, I):
-                for j2 in range(j1, J):
-                    if i1 == i2 and j1 == j2:
-                        continue
-
-                    total_comparisons += 1
-
-                    if policy_grid[i2, j2] > policy_grid[i1, j1] + 1e-6:
-                        violations += 1
-
-    score = (total_comparisons - violations) / total_comparisons if total_comparisons > 0 else 1.0
-
-    return score, {'violations': violations, 'total_comparisons': total_comparisons}
-
-
-def evaluate_adjacent_monotonicity(policy_grid):
-    """Adjacent-cell monotonicity check."""
-    I, J = policy_grid.shape
-
-    violations_inf = 0
-    violations_risk = 0
-
-    for j in range(J):
-        for i in range(I - 1):
-            if policy_grid[i + 1, j] > policy_grid[i, j] + 1e-6:
-                violations_inf += 1
-
-    for i in range(I):
-        for j in range(J - 1):
-            if policy_grid[i, j + 1] > policy_grid[i, j] + 1e-6:
-                violations_risk += 1
-
-    total_inf_transitions = J * (I - 1)
-    total_risk_transitions = I * (J - 1)
-    total_transitions = total_inf_transitions + total_risk_transitions
-    total_violations = violations_inf + violations_risk
-
-    score = (total_transitions - total_violations) / total_transitions if total_transitions > 0 else 1.0
-
-    details = {
-        'infected_violations': violations_inf,
-        'risk_violations': violations_risk,
-        'total_violations': total_violations,
-        'total_transitions': total_transitions
-    }
-
-    return score, details
-
-
-def compute_action_diversity(policy_grid, num_bins=10):
-    """Compute action diversity metrics."""
-    flat_actions = policy_grid.flatten()
-
-    bins = np.linspace(0, 1, num_bins + 1)
-    hist, _ = np.histogram(flat_actions, bins=bins)
-    num_unique_bins = np.sum(hist > 0)
-
-    return {
-        'action_min': float(flat_actions.min()),
-        'action_max': float(flat_actions.max()),
-        'action_range': float(flat_actions.max() - flat_actions.min()),
-        'action_std': float(flat_actions.std()),
-        'num_unique_bins': int(num_unique_bins)
-    }
-
-
-# ============================================================
-# 6. HYPERPARAMETER TUNING
-# ============================================================
-
-def select_best_lr(omega_results):
-    """Select best learning rate based on monotonicity and reward."""
-    sorted_results = sorted(
-        omega_results,
-        key=lambda r: (r['dominance_violations'], -r['avg_eval_reward'], -r['num_unique_bins'])
-    )
+def select_best_hyperparams(omega_results):
+    """Select best hyperparameters based on reward."""
+    sorted_results = sorted(omega_results, key=lambda r: -r['avg_eval_reward'])
 
     best = sorted_results[0]
-    return best['lr'], best, {'min_violations': best['dominance_violations']}
+    return (best['lr'], best['hidden_dim']), best, {}
 
 
 def grid_search_tuning(num_classrooms=NUM_CLASSROOMS):
-    """Grid search for best learning rate per omega."""
-    optimized_lrs = {}
+    """Grid search for best learning rate and hidden dimension per omega."""
+    optimized_hyperparams = {}
 
-    print(f"\n--- Starting Grid Search Tuning (Tanh Policy) ---")
+    print(f"\n--- Starting Grid Search Tuning (Beta Policy) ---")
     print(f"LR Candidates: {LR_CANDIDATES}")
+    print(f"Hidden Dim Candidates: {HIDDEN_DIM_CANDIDATES}")
     print(f"Number of Classrooms: {num_classrooms}")
 
     for omega in OMEGA_VALUES:
@@ -672,171 +545,112 @@ def grid_search_tuning(num_classrooms=NUM_CLASSROOMS):
         omega_results = []
 
         for lr in LR_CANDIDATES:
-            print(f"\n  Testing LR={lr}...")
+            for hidden_dim in HIDDEN_DIM_CANDIDATES:
+                print(f"\n  Testing LR={lr}, Hidden Dim={hidden_dim}...")
 
-            ppo, history = run_centralized_training(omega, TUNE_SEED, lr, TUNE_EPISODES, num_classrooms)
+                ppo, history = run_centralized_training(omega, TUNE_SEED, lr, TUNE_EPISODES, num_classrooms, hidden_dim)
 
-            # Evaluation
-            env = MultiClassroomEnv(
-                num_classrooms=num_classrooms,
-                total_students=TOTAL_STUDENTS,
-                max_weeks=MAX_WEEKS,
-                gamma=omega,
-                continuous_action=True,
-                cooperative_reward=COOPERATIVE_REWARD,
-                eval_mode=True,
-                community_risk_data_file="weekly_risk_sample_b.csv"
-            )
-            agent_ids = sorted(env.agents)
-            obs = env.reset()
-            global_state = normalize_global_state(obs, agent_ids, TOTAL_STUDENTS)
-            done = False
-            avg_eval_reward = 0
-            
-            while not done:
-                state_tensor = torch.FloatTensor(global_state).unsqueeze(0).to(device)
-                with torch.no_grad():
-                    actions_normalized = ppo.actor.get_deterministic_action(state_tensor).cpu().numpy().flatten()
-                actions_env = {aid: np.array([actions_normalized[i] * TOTAL_STUDENTS]) for i, aid in enumerate(agent_ids)}
-                next_obs, rewards, dones, _ = env.step(actions_env)
-                avg_eval_reward += sum(rewards.values()) / len(rewards)
-                global_state = normalize_global_state(next_obs, agent_ids, TOTAL_STUDENTS)
-                done = any(dones.values())
+                # Evaluation
+                env = MultiClassroomEnv(
+                    num_classrooms=num_classrooms,
+                    total_students=TOTAL_STUDENTS,
+                    max_weeks=MAX_WEEKS,
+                    gamma=omega,
+                    continuous_action=True,
+                    cooperative_reward=COOPERATIVE_REWARD,
+                    eval_mode=True
+                )
+                agent_ids = sorted(env.agents)
+                obs = env.reset()
+                global_state = normalize_global_state(obs, agent_ids, TOTAL_STUDENTS)
+                done = False
+                avg_eval_reward = 0
 
-            # Extract and evaluate policy
-            policy_grids = extract_joint_policy_grid(ppo)
+                while not done:
+                    state_tensor = torch.FloatTensor(global_state).unsqueeze(0).to(device)
+                    with torch.no_grad():
+                        actions_normalized = ppo.actor.get_deterministic_action(state_tensor).cpu().numpy().flatten()
+                    actions_env = {aid: np.array([actions_normalized[i] * TOTAL_STUDENTS]) for i, aid in enumerate(agent_ids)}
+                    next_obs, rewards, dones, _ = env.step(actions_env)
+                    avg_eval_reward += sum(rewards.values()) / len(rewards)
+                    global_state = normalize_global_state(next_obs, agent_ids, TOTAL_STUDENTS)
+                    done = any(dones.values())
 
-            total_violations = 0
-            mono_scores = []
-            diversity_metrics = []
+                result = {
+                    'lr': lr,
+                    'hidden_dim': hidden_dim,
+                    'avg_eval_reward': avg_eval_reward,
+                }
+                omega_results.append(result)
 
-            for agent_idx, policy_grid in enumerate(policy_grids):
-                mono, details = evaluate_dominance_monotonicity(policy_grid)
-                mono_scores.append(mono)
-                total_violations += details['violations']
-                diversity_metrics.append(compute_action_diversity(policy_grid))
+                print(f"    Reward: {avg_eval_reward:.2f}")
 
-            avg_mono_score = np.mean(mono_scores)
-            avg_unique_bins = np.mean([d['num_unique_bins'] for d in diversity_metrics])
-            avg_action_range = np.mean([d['action_range'] for d in diversity_metrics])
+        best_hyperparams, best_metrics, _ = select_best_hyperparams(omega_results)
+        best_lr, best_hidden_dim = best_hyperparams
+        optimized_hyperparams[str(omega)] = {'lr': best_lr, 'hidden_dim': best_hidden_dim}
+        print(f"\n  --> Best LR: {best_lr}, Best Hidden Dim: {best_hidden_dim}")
 
-            result = {
-                'lr': lr,
-                'avg_eval_reward': avg_eval_reward,
-                'dominance_violations': total_violations,
-                'avg_mono_score': avg_mono_score,
-                'mono_scores': mono_scores,
-                'num_unique_bins': avg_unique_bins,
-                'action_range': avg_action_range
-            }
-            omega_results.append(result)
+    with open(HYPERPARAMS_FILE, 'w') as f:
+        json.dump(optimized_hyperparams, f, indent=4)
 
-            print(f"    Reward: {avg_eval_reward:.2f}")
-            print(f"    Avg Monotonicity: {avg_mono_score:.4f}")
-            print(f"    Total Violations: {total_violations}")
-
-        best_lr, best_metrics, _ = select_best_lr(omega_results)
-        optimized_lrs[str(omega)] = best_lr
-        print(f"\n  --> Best LR: {best_lr}")
-
-    with open(LR_FILE, 'w') as f:
-        json.dump(optimized_lrs, f, indent=4)
-
-    return {float(k): v for k, v in optimized_lrs.items()}
+    return {float(k): v for k, v in optimized_hyperparams.items()}
 
 
-def load_lrs():
-    """Load optimized LRs from file."""
-    if os.path.exists(LR_FILE):
-        with open(LR_FILE, 'r') as f:
-            return {float(k): float(v) for k, v in json.load(f).items()}
-    return {omega: 0.001 for omega in OMEGA_VALUES}
+def load_hyperparams():
+    """Load optimized hyperparameters from file."""
+    if os.path.exists(HYPERPARAMS_FILE):
+        with open(HYPERPARAMS_FILE, 'r') as f:
+            return {float(k): v for k, v in json.load(f).items()}
+    return {omega: {'lr': 0.001, 'hidden_dim': 32} for omega in OMEGA_VALUES}
 
 
 # ============================================================
-# 7. FULL TRAINING AND EVALUATION
+# 6. FULL TRAINING AND EVALUATION
 # ============================================================
 
-def train_and_evaluate_optimal(optimized_lrs, num_classrooms=NUM_CLASSROOMS):
-    """Run full training with optimized LRs and save models."""
-    print(f"\n--- Starting Full Training (Tanh Policy) ---")
+def train_and_evaluate_optimal(optimized_hyperparams, num_classrooms=NUM_CLASSROOMS):
+    """Run full training with optimized hyperparameters and save models."""
+    print(f"\n--- Starting Full Training (Beta Policy) ---")
     print(f"Number of Classrooms: {num_classrooms}")
 
     all_rewards = {}
     trained_agents = {}
-    monotonicity_scores = {}
 
     for omega in OMEGA_VALUES:
-        lr = optimized_lrs.get(omega, 0.001)
+        hyperparams = optimized_hyperparams.get(omega, {'lr': 0.001, 'hidden_dim': 32})
+        lr = hyperparams['lr']
+        hidden_dim = hyperparams['hidden_dim']
         print(f"\n{'=' * 60}")
-        print(f"*** Training Omega = {omega}, LR = {lr} ***")
+        print(f"*** Training Omega = {omega}, LR = {lr}, Hidden Dim = {hidden_dim} ***")
         print(f"{'=' * 60}")
 
         for run in range(NUM_RUNS):
             seed = TUNE_SEED
             print(f"\n  Run {run + 1}/{NUM_RUNS} (seed={seed})")
 
-            ppo, history = run_centralized_training(omega, seed, lr, FULL_EPISODES, num_classrooms)
+            ppo, history = run_centralized_training(omega, seed, lr, FULL_EPISODES, num_classrooms, hidden_dim)
 
             # Save model
-            model_path = os.path.join(MODEL_DIR, f"centralized_omega_{omega}_run_{run}")
+            model_path = os.path.join(MODEL_DIR, f"centralized_omega_{omega}_hd_{hidden_dim}_run_{run}")
             ppo.save(model_path)
 
             if run == 0:
                 all_rewards[omega] = np.array([history])
                 trained_agents[omega] = ppo
 
-        # Evaluate monotonicity
-        policy_grids = extract_joint_policy_grid(trained_agents[omega])
-
-        dom_scores = []
-        dom_violations = 0
-        adj_scores = []
-        adj_violations = 0
-
-        for agent_idx, policy_grid in enumerate(policy_grids):
-            mono, details = evaluate_dominance_monotonicity(policy_grid)
-            dom_scores.append(mono)
-            dom_violations += details['violations']
-
-            adj, adj_details = evaluate_adjacent_monotonicity(policy_grid)
-            adj_scores.append(adj)
-            adj_violations += adj_details['total_violations']
-
-        monotonicity_scores[omega] = {
-            'dominance_score': float(np.mean(dom_scores)),
-            'dominance_violations': int(dom_violations),
-            'adjacent_score': float(np.mean(adj_scores)),
-            'adjacent_violations': int(adj_violations),
-            'agent_scores': [float(s) for s in dom_scores]
-        }
-
         print(f"  Final Reward: {np.mean(history[-50:]):.2f}")
-        print(f"  Avg Monotonicity: {np.mean(dom_scores):.4f}")
 
     # Plot results
     plot_combined_rewards(all_rewards)
-    plot_policy_grids(trained_agents, num_classrooms)
-    plot_monotonicity_summary(monotonicity_scores, num_classrooms)
-
-    # Save results
-    with open(os.path.join(OUTPUT_DIR, "monotonicity_scores.json"), 'w') as f:
-        json.dump({str(k): v for k, v in monotonicity_scores.items()}, f, indent=4)
 
     print(f"\nTraining complete. Models saved to {MODEL_DIR}")
-    
-    return trained_agents, monotonicity_scores
+
+    return trained_agents
 
 
 # ============================================================
-# 8. PLOTTING FUNCTIONS
+# 7. PLOTTING FUNCTIONS
 # ============================================================
-
-def generate_distinct_colors(n):
-    HSV = [(x / n, 0.6, 0.95) for x in range(n)]
-    RGB = [colorsys.hsv_to_rgb(*x) for x in HSV]
-    return ['#{:02x}{:02x}{:02x}'.format(int(r * 255), int(g * 255), int(b * 255)) for (r, g, b) in RGB]
-
 
 def plot_combined_rewards(all_rewards):
     """Plot training rewards."""
@@ -857,7 +671,7 @@ def plot_combined_rewards(all_rewards):
 
     plt.xlabel('Episode')
     plt.ylabel('Reward')
-    plt.title('Centralized PPO Training Rewards (Tanh Policy)')
+    plt.title('Centralized PPO Training Rewards (Beta Policy)')
     plt.legend()
     plt.grid(True, alpha=0.3)
     plt.tight_layout()
@@ -865,124 +679,31 @@ def plot_combined_rewards(all_rewards):
     plt.close()
 
 
-def plot_policy_grids(trained_agents, num_classrooms=NUM_CLASSROOMS):
-    """Plot policy grids for all agents across omega values."""
-    print("\n--- Plotting Policy Grids ---")
-
-    max_agents_to_plot = min(num_classrooms, 4)
-
-    fig, axes = plt.subplots(max_agents_to_plot, len(OMEGA_VALUES),
-                             figsize=(3.5 * len(OMEGA_VALUES), 3 * max_agents_to_plot),
-                             sharey=True)
-
-    if max_agents_to_plot == 1:
-        axes = axes.reshape(1, -1)
-
-    base_colors = generate_distinct_colors(12)
-    cmap = LinearSegmentedColormap.from_list("custom", base_colors, N=256)
-
-    for idx, omega in enumerate(OMEGA_VALUES):
-        ppo = trained_agents[omega]
-        policy_grids = extract_joint_policy_grid(ppo)
-
-        for agent_idx in range(max_agents_to_plot):
-            policy_grid = policy_grids[agent_idx]
-            ax = axes[agent_idx, idx]
-
-            im = ax.imshow(
-                policy_grid,
-                extent=[0, 1, 0, TOTAL_STUDENTS],
-                origin='lower',
-                aspect='auto',
-                cmap=cmap,
-                vmin=0.0,
-                vmax=1.0
-            )
-
-            ax.set_title(f'ω={omega} | Agent {agent_idx}')
-
-            if agent_idx == max_agents_to_plot - 1:
-                ax.set_xlabel('Risk')
-            if idx == 0:
-                ax.set_ylabel('Infected Count')
-
-    cbar_ax = fig.add_axes([0.92, 0.15, 0.01, 0.7])
-    fig.colorbar(im, cax=cbar_ax, label='Action (Capacity Fraction)')
-
-    title = f'Centralized PPO Policies ({num_classrooms} Classrooms)'
-    if num_classrooms > max_agents_to_plot:
-        title += f' (showing first {max_agents_to_plot})'
-    plt.suptitle(title, fontsize=14, fontweight='bold')
-    plt.tight_layout(rect=[0, 0, 0.9, 0.95])
-    plt.savefig(os.path.join(OUTPUT_DIR, "policy_grids.png"), dpi=300, bbox_inches='tight')
-    plt.close()
-
-
-def plot_monotonicity_summary(monotonicity_scores, num_classrooms=NUM_CLASSROOMS):
-    """Plot monotonicity scores."""
-    print("\n--- Plotting Monotonicity Summary ---")
-
-    omegas = list(monotonicity_scores.keys())
-    max_agents_to_plot = min(num_classrooms, 4)
-
-    fig, ax = plt.subplots(figsize=(12, 5))
-
-    x = np.arange(len(omegas))
-    width = 0.8 / max_agents_to_plot
-
-    colors = plt.cm.Set2(np.linspace(0, 1, max_agents_to_plot))
-
-    for agent_idx in range(max_agents_to_plot):
-        scores = []
-        for o in omegas:
-            agent_scores = monotonicity_scores[o]['agent_scores']
-            if agent_idx < len(agent_scores):
-                scores.append(agent_scores[agent_idx])
-            else:
-                scores.append(0)
-
-        offset = (agent_idx - max_agents_to_plot / 2 + 0.5) * width
-        ax.bar(x + offset, scores, width, label=f'Agent {agent_idx}', color=colors[agent_idx])
-
-    ax.set_xlabel('Omega (ω)')
-    ax.set_ylabel('Monotonicity Score')
-    ax.set_title(f'Centralized PPO - Policy Monotonicity ({num_classrooms} Classrooms)')
-    ax.set_xticks(x)
-    ax.set_xticklabels([f'{o}' for o in omegas])
-    ax.set_ylim(0, 1.05)
-    ax.legend(loc='lower right')
-    ax.axhline(y=1.0, color='green', linestyle='--', alpha=0.5)
-
-    plt.tight_layout()
-    plt.savefig(os.path.join(OUTPUT_DIR, "monotonicity_summary.png"), dpi=300)
-    plt.close()
-
-
 # ============================================================
-# 9. MAIN
+# 8. MAIN
 # ============================================================
 
 def main(mode='tune_and_train', num_classrooms=NUM_CLASSROOMS):
     """
     Main function.
-    
+
     Modes:
-    - 'tune': Grid search for best LRs
-    - 'train': Train with saved LRs
+    - 'tune': Grid search for best hyperparameters (LR and Hidden Dim)
+    - 'train': Train with saved hyperparameters
     - 'tune_and_train': Both
     """
     print(f"\n{'='*60}")
-    print(f"Centralized PPO Training (Tanh Policy)")
+    print(f"Centralized PPO Training (Beta Policy)")
     print(f"Number of Classrooms: {num_classrooms}")
     print(f"{'='*60}")
 
     if mode in ['tune', 'tune_and_train']:
-        optimized_lrs = grid_search_tuning(num_classrooms)
+        optimized_hyperparams = grid_search_tuning(num_classrooms)
     else:
-        optimized_lrs = load_lrs()
+        optimized_hyperparams = load_hyperparams()
 
     if mode in ['train', 'tune_and_train']:
-        train_and_evaluate_optimal(optimized_lrs, num_classrooms)
+        train_and_evaluate_optimal(optimized_hyperparams, num_classrooms)
 
     print(f"\nResults saved to {OUTPUT_DIR}")
 

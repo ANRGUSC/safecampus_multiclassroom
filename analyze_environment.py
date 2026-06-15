@@ -1,849 +1,800 @@
 """
-Comprehensive Environment Analysis for Multi-Classroom Epidemic Control
+Diagnostic Evaluation for Multi-Classroom Epidemic Control
 
-Computes:
-1. Dynamic Programming (Backward Induction) Upper Bound
-2. Myopic Optimal Policy (one-step lookahead)
-3. Evaluates trained RL models (CTDE, Centralized)
-4. Random baseline
+The methods do NOT solve the same problem, so this is deliberately framed as a
+DIAGNOSTIC ("what is each method doing, and why") rather than a leaderboard.
+Methods are grouped into matched information regimes and compared WITHIN a regime;
+cross-regime differences are reported as named, caveated decompositions.
 
-IMPORTANT: All policies use the actual environment for transitions and rewards.
-No dynamics are reimplemented - we query the environment directly.
+Information regimes
+-------------------
+  Full-info  (acts on the full joint state):
+      - DP             : perfect-foresight optimum (discrete-action ceiling)
+      - Joint-Myopic   : full-state 1-step greedy
+      - Centralized PPO: learned joint controller
+  Local-info (acts on local observation only):
+      - Dec-Myopic     : per-room 1-step greedy on its OWN state (neighbors unseen)
+      - CTDE MAPPO     : learned decentralized actors
+  Floor:
+      - Random
+
+Named decompositions (each isolates one factor)
+  price of decentralization = Centralized - CTDE        (cost of local-only obs)
+  optimality / foresight gap = DP - Centralized          (within full-info: fair)
+  value of lookahead         = Centralized - Joint-Myopic
+
+Scenario families (both reported, paired across methods via shared seeds)
+  synthetic : K held-out seeds -> sampled sine risk + random init (in-distribution)
+  real      : CSV weekly risk path fixed, random init varied over the K seeds
+
+All metrics are reward-derived. CIs / significance use bootstrap (no scipy needed).
+The environment is the SAME for every method (TOTAL_STUDENTS, dynamics, reward).
 
 Author: SafeCampus Project
 """
 
 import numpy as np
-from typing import List, Dict, Tuple, Optional
 import matplotlib.pyplot as plt
 import os
 import json
 import time
 import pandas as pd
-import copy
 
 from environment.multiclassroom import MultiClassroomEnv
 
 # ============================================================
 # CONFIGURATION
 # ============================================================
-OUTPUT_DIR = "analysis_results_0.8_gamma"
+OUTPUT_DIR = "analysis_results"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-# Environment parameters
-TOTAL_STUDENTS = 100
+# Shared environment config (must match the trainers)
+TOTAL_STUDENTS = 50
 NUM_CLASSROOMS = 2
 MAX_WEEKS = 15
+COOPERATIVE_REWARD = True
 COMMUNITY_RISK_FILE = "weekly_risk_sample_b.csv"
 
-# DP Discretization
-N_INFECTED_BINS = 21
-N_ACTION_BINS = 11  # Actions: 0, 10, 20, ..., 100
+# Discrete action grid (DP + both myopic baselines, for fair comparison)
+N_ACTION_BINS = 7
 
-# Evaluation
-NUM_EVAL_EPISODES = 30
-EVAL_SEED = 42
+# Paired evaluation: K scenarios per family, shared across all methods.
+# DP is run on a smaller subset (its cache is per (omega, scenario) -> expensive).
+K_SCENARIOS = 50
+DP_SCENARIOS = 10
+EVAL_SEED_BASE = 9000  # held-out block, disjoint from training seeds (123, 101, 42)
 
-# Omega values to analyze
 OMEGA_VALUES = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6]
+
+# Bootstrap
+N_BOOT = 2000
+
+# Method registry: name -> (label, league, color)
+LEAGUE = {
+    'dp':            ('DP (foresight ceiling)', 'full_info', 'gold'),
+    'joint_myopic':  ('Joint-Myopic',           'full_info', 'forestgreen'),
+    'centralized':   ('Centralized PPO',         'full_info', 'steelblue'),
+    'dec_myopic':    ('Dec-Myopic',              'local_info', 'darkorange'),
+    'ctde':          ('CTDE MAPPO',              'local_info', 'coral'),
+    'random':        ('Random',                  'floor', 'gray'),
+}
+FULL_INFO = ['dp', 'joint_myopic', 'centralized']
+LOCAL_INFO = ['dec_myopic', 'ctde']
+ALL_METHODS = ['dp', 'joint_myopic', 'centralized', 'dec_myopic', 'ctde', 'random']
 
 plt.rcParams.update({
     'font.size': 12,
     'font.weight': 'bold',
     'axes.labelweight': 'bold',
-    'axes.titleweight': 'bold'
+    'axes.titleweight': 'bold',
 })
 
 
-def set_seed(seed):
-    np.random.seed(seed)
+# ============================================================
+# SCENARIOS
+# ============================================================
+
+def load_real_risk(path=COMMUNITY_RISK_FILE):
+    """Load the real weekly community-risk series (truncated/padded to MAX_WEEKS)."""
+    if not os.path.exists(path):
+        print(f"  WARNING: real risk file {path} not found; real family will be skipped.")
+        return None
+    df = pd.read_csv(path)
+    risk_col = next((c for c in df.columns if 'risk' in c.lower()), df.columns[-1])
+    risk = [float(x) for x in df[risk_col].tolist()]
+    if len(risk) >= MAX_WEEKS:
+        return risk[:MAX_WEEKS]
+    return risk + [risk[-1]] * (MAX_WEEKS - len(risk))  # pad with last value
+
+
+def build_scenarios(k=K_SCENARIOS):
+    """Build the shared, paired scenario sets for both families."""
+    seeds = [EVAL_SEED_BASE + i for i in range(k)]
+    real_risk = load_real_risk()
+    families = {'synthetic': {'seeds': seeds, 'risk': None}}
+    if real_risk is not None:
+        families['real'] = {'seeds': seeds, 'risk': real_risk}
+    return families
+
+
+def make_env(omega):
+    return MultiClassroomEnv(
+        num_classrooms=NUM_CLASSROOMS,
+        total_students=TOTAL_STUDENTS,
+        max_weeks=MAX_WEEKS,
+        gamma=omega,
+        continuous_action=True,
+        cooperative_reward=COOPERATIVE_REWARD,
+        eval_mode=False,
+    )
+
+
+def current_risk(env):
+    w = min(env.current_week, len(env.shared_community_risk) - 1)
+    return env.shared_community_risk[w]
 
 
 # ============================================================
-# MYOPIC OPTIMAL POLICY
-# ============================================================
-
-class MyopicAgent:
-    """
-    Myopic (one-step lookahead) optimal policy.
-    
-    For each step, tries all possible action combinations using the actual
-    environment and picks the one with best immediate reward.
-    
-    Uses environment directly - no reimplemented dynamics.
-    """
-    
-    def __init__(
-        self,
-        omega: float,
-        num_classrooms: int = NUM_CLASSROOMS,
-        total_students: int = TOTAL_STUDENTS,
-        n_action_bins: int = N_ACTION_BINS
-    ):
-        self.omega = omega
-        self.num_classrooms = num_classrooms
-        self.total_students = total_students
-        
-        # Discrete action options to search over
-        self.action_options = np.linspace(0, total_students, n_action_bins)
-        self.n_actions = n_action_bins
-    
-    def _create_env_copy(self, env: MultiClassroomEnv) -> MultiClassroomEnv:
-        """Create a copy of environment state for lookahead."""
-        env_copy = MultiClassroomEnv(
-            num_classrooms=self.num_classrooms,
-            total_students=self.total_students,
-            max_weeks=MAX_WEEKS,
-            gamma=self.omega,
-            continuous_action=True,
-            cooperative_reward=True,
-            eval_mode=True,
-            community_risk_data_file=COMMUNITY_RISK_FILE
-        )
-        # Copy current state
-        env_copy.student_status = list(env.student_status)
-        env_copy.current_week = env.current_week
-        if hasattr(env, 'shared_community_risk'):
-            env_copy.shared_community_risk = env.shared_community_risk.copy()
-        return env_copy
-    
-    def select_action(self, env: MultiClassroomEnv) -> List[float]:
-        """
-        Select best joint action via grid search.
-        
-        Tries all action combinations on copies of the environment
-        and returns the one with highest immediate reward.
-        """
-        agent_ids = sorted(env.agents)
-        best_actions = [0.0] * self.num_classrooms
-        best_reward = -float('inf')
-        
-        if self.num_classrooms == 2:
-            # Two classrooms - nested loop
-            for a1 in self.action_options:
-                for a2 in self.action_options:
-                    # Create a copy to test this action
-                    env_copy = self._create_env_copy(env)
-                    
-                    actions_for_env = {
-                        agent_ids[0]: np.array([a1]),
-                        agent_ids[1]: np.array([a2])
-                    }
-                    
-                    # Step the copy to get reward
-                    _, rewards, _, _ = env_copy.step(actions_for_env)
-                    reward = sum(rewards.values()) / len(agent_ids)
-                    
-                    if reward > best_reward:
-                        best_reward = reward
-                        best_actions = [a1, a2]
-        else:
-            # General case
-            from itertools import product
-            for actions_tuple in product(self.action_options, repeat=self.num_classrooms):
-                actions = list(actions_tuple)
-                
-                env_copy = self._create_env_copy(env)
-                
-                actions_for_env = {
-                    aid: np.array([actions[i]])
-                    for i, aid in enumerate(agent_ids)
-                }
-                
-                _, rewards, _, _ = env_copy.step(actions_for_env)
-                reward = sum(rewards.values()) / len(agent_ids)
-                
-                if reward > best_reward:
-                    best_reward = reward
-                    best_actions = actions
-        
-        return best_actions
-    
-    def evaluate(
-        self, 
-        num_episodes: int = NUM_EVAL_EPISODES, 
-        seed: int = EVAL_SEED
-    ) -> Tuple[float, float, List[float]]:
-        """Evaluate myopic policy on actual environment."""
-        set_seed(seed)
-        
-        episode_rewards = []
-        
-        for ep in range(num_episodes):
-            env = MultiClassroomEnv(
-                num_classrooms=self.num_classrooms,
-                total_students=self.total_students,
-                max_weeks=MAX_WEEKS,
-                gamma=self.omega,
-                continuous_action=True,
-                cooperative_reward=True,
-                eval_mode=True,
-                community_risk_data_file=COMMUNITY_RISK_FILE
-            )
-            
-            obs = env.reset()
-            agent_ids = sorted(env.agents)
-            
-            ep_reward = 0
-            done = False
-            
-            while not done:
-                # Get myopic optimal action by searching over all options
-                actions = self.select_action(env)
-                
-                # Execute in environment
-                actions_for_env = {
-                    aid: np.array([actions[i]])
-                    for i, aid in enumerate(agent_ids)
-                }
-                
-                obs, rewards, dones, _ = env.step(actions_for_env)
-                ep_reward += sum(rewards.values()) / len(agent_ids)
-                
-                done = any(dones.values())
-            
-            episode_rewards.append(ep_reward)
-        
-        return np.mean(episode_rewards), np.std(episode_rewards), episode_rewards
-
-
-# ============================================================
-# DYNAMIC PROGRAMMING UPPER BOUND
-# ============================================================
-
-class DPUpperBound:
-    """
-    Backward Induction DP Solver.
-    
-    For a FIXED risk trajectory (eval_mode), computes optimal policy via 
-    backward induction. This is an UPPER BOUND because RL agents don't 
-    know future risks.
-    
-    Uses actual environment for all transitions and rewards.
-    
-    State: (I_1, I_2, ..., I_N, t) - discretized infected counts and time
-    The risk r_t is deterministic in eval_mode so we don't need it in state.
-    """
-    
-    def __init__(
-        self,
-        omega: float,
-        num_classrooms: int = NUM_CLASSROOMS,
-        total_students: int = TOTAL_STUDENTS,
-        max_weeks: int = MAX_WEEKS,
-        n_infected_bins: int = N_INFECTED_BINS,
-        n_action_bins: int = N_ACTION_BINS
-    ):
-        self.omega = omega
-        self.num_classrooms = num_classrooms
-        self.total_students = total_students
-        self.max_weeks = max_weeks
-        self.n_infected_bins = n_infected_bins
-        self.n_action_bins = n_action_bins
-        
-        # Discretization grids
-        self.infected_vals = np.linspace(0, total_students, n_infected_bins).astype(int)
-        self.action_vals = np.linspace(0, total_students, n_action_bins)
-        
-        # Value function and policy storage
-        self.V = None
-        self.policy = None
-    
-    def _get_infected_index(self, infected: int) -> int:
-        """Map infected count to nearest grid index."""
-        idx = np.argmin(np.abs(self.infected_vals - infected))
-        return idx
-    
-    def _create_env_at_state(self, infected: List[int], week: int) -> MultiClassroomEnv:
-        """Create environment at a specific state."""
-        env = MultiClassroomEnv(
-            num_classrooms=self.num_classrooms,
-            total_students=self.total_students,
-            max_weeks=self.max_weeks,
-            gamma=self.omega,
-            continuous_action=True,
-            cooperative_reward=True,
-            eval_mode=True,
-            community_risk_data_file=COMMUNITY_RISK_FILE
-        )
-        env.reset()
-        # Set state
-        env.student_status = list(infected)
-        env.current_week = week
-        return env
-    
-    def _simulate_step(
-        self, 
-        infected: List[int], 
-        actions: List[float], 
-        week: int
-    ) -> Tuple[List[int], float]:
-        """
-        Simulate one step using actual environment.
-        
-        Returns: (next_infected, reward)
-        """
-        env = self._create_env_at_state(infected, week)
-        agent_ids = sorted(env.agents)
-        
-        actions_for_env = {
-            aid: np.array([actions[i]])
-            for i, aid in enumerate(agent_ids)
-        }
-        
-        _, rewards, _, _ = env.step(actions_for_env)
-        
-        next_infected = list(env.student_status)
-        reward = sum(rewards.values()) / len(agent_ids)
-        
-        return next_infected, reward
-    
-    def solve(self, verbose: bool = True) -> Dict:
-        """
-        Run backward induction to compute optimal policy.
-        
-        For N=2 classrooms:
-        State: (i1_idx, i2_idx, t)
-        V[t, i1, i2] = max over actions { R + V[t+1, i1', i2'] }
-        """
-        T = self.max_weeks
-        n_inf = self.n_infected_bins
-        N = self.num_classrooms
-        
-        if verbose:
-            print("=" * 70)
-            print("DP UPPER BOUND SOLVER (Backward Induction)")
-            print("=" * 70)
-            print(f"Classrooms: {N}, Horizon: {T}, ω: {self.omega}")
-            print(f"State grid: {n_inf}^{N} = {n_inf**N} states per time")
-            print(f"Action grid: {self.n_action_bins}^{N} = {self.n_action_bins**N} joint actions")
-            print()
-        
-        if N != 2:
-            raise NotImplementedError("Currently only supports 2 classrooms for DP")
-        
-        # Initialize value function: V[t, i1_idx, i2_idx]
-        # V[T, :, :] = 0 (terminal value)
-        self.V = np.zeros((T + 1, n_inf, n_inf))
-        
-        # Policy: policy[t, i1_idx, i2_idx, agent] = action value
-        self.policy = np.zeros((T, n_inf, n_inf, N))
-        
-        start_time = time.time()
-        
-        # Backward induction: t = T-1, T-2, ..., 0
-        for t in range(T - 1, -1, -1):
-            if verbose:
-                print(f"  Processing t={t}...", end=" ", flush=True)
-            
-            for i1_idx, i1 in enumerate(self.infected_vals):
-                for i2_idx, i2 in enumerate(self.infected_vals):
-                    infected = [int(i1), int(i2)]
-                    
-                    best_value = -float('inf')
-                    best_actions = [0.0, 0.0]
-                    
-                    # Grid search over all action combinations
-                    for a1 in self.action_vals:
-                        for a2 in self.action_vals:
-                            actions = [a1, a2]
-                            
-                            # Use environment to compute transition
-                            next_infected, reward = self._simulate_step(infected, actions, t)
-                            
-                            # Get next state indices
-                            next_i1_idx = self._get_infected_index(next_infected[0])
-                            next_i2_idx = self._get_infected_index(next_infected[1])
-                            
-                            # Bellman update: Q = R + V_{t+1}
-                            future_value = self.V[t + 1, next_i1_idx, next_i2_idx]
-                            q_value = reward + future_value
-                            
-                            if q_value > best_value:
-                                best_value = q_value
-                                best_actions = actions
-                    
-                    self.V[t, i1_idx, i2_idx] = best_value
-                    self.policy[t, i1_idx, i2_idx, :] = best_actions
-            
-            if verbose:
-                avg_v = self.V[t].mean()
-                print(f"avg V={avg_v:.2f}")
-        
-        elapsed = time.time() - start_time
-        
-        if verbose:
-            print(f"\nSolve time: {elapsed:.1f}s")
-            # Value at typical starting state
-            i1_idx = self._get_infected_index(3)
-            i2_idx = self._get_infected_index(3)
-            print(f"V*(I=(3,3), t=0) = {self.V[0, i1_idx, i2_idx]:.2f}")
-        
-        return {
-            'V': self.V,
-            'policy': self.policy,
-            'solve_time': elapsed
-        }
-    
-    def get_optimal_action(self, t: int, infected: List[int]) -> List[float]:
-        """Get optimal action for given time and state."""
-        i1_idx = self._get_infected_index(infected[0])
-        i2_idx = self._get_infected_index(infected[1])
-        return list(self.policy[t, i1_idx, i2_idx, :])
-    
-    def evaluate(
-        self, 
-        num_episodes: int = NUM_EVAL_EPISODES, 
-        seed: int = EVAL_SEED
-    ) -> Tuple[float, float, List[float]]:
-        """Evaluate the DP policy on the environment."""
-        if self.policy is None:
-            raise ValueError("Must call solve() before evaluate()")
-        
-        set_seed(seed)
-        episode_rewards = []
-        
-        for ep in range(num_episodes):
-            env = MultiClassroomEnv(
-                num_classrooms=self.num_classrooms,
-                total_students=self.total_students,
-                max_weeks=self.max_weeks,
-                gamma=self.omega,
-                continuous_action=True,
-                cooperative_reward=True,
-                eval_mode=True,
-                community_risk_data_file=COMMUNITY_RISK_FILE
-            )
-            
-            obs = env.reset()
-            agent_ids = sorted(env.agents)
-            
-            ep_reward = 0
-            done = False
-            t = 0
-            
-            while not done:
-                # Get current infected from environment
-                infected = [env.student_status[i] for i in range(self.num_classrooms)]
-                
-                # Get DP optimal action
-                actions = self.get_optimal_action(t, infected)
-                
-                # Execute
-                actions_for_env = {
-                    aid: np.array([actions[i]])
-                    for i, aid in enumerate(agent_ids)
-                }
-                
-                obs, rewards, dones, _ = env.step(actions_for_env)
-                ep_reward += sum(rewards.values()) / len(agent_ids)
-                
-                done = any(dones.values())
-                t += 1
-            
-            episode_rewards.append(ep_reward)
-        
-        return np.mean(episode_rewards), np.std(episode_rewards), episode_rewards
-
-
-# ============================================================
-# RANDOM BASELINE
+# POLICIES  (interface: act(env, obs, agent_ids, omega) -> {aid: np.array([value])})
 # ============================================================
 
 class RandomPolicy:
-    """Random uniform actions baseline."""
-    
-    def __init__(
-        self,
-        omega: float,
-        num_classrooms: int = NUM_CLASSROOMS,
-        total_students: int = TOTAL_STUDENTS
-    ):
-        self.omega = omega
-        self.num_classrooms = num_classrooms
-        self.total_students = total_students
-    
-    def evaluate(
-        self, 
-        num_episodes: int = NUM_EVAL_EPISODES, 
-        seed: int = EVAL_SEED
-    ) -> Tuple[float, float, List[float]]:
-        """Evaluate random policy."""
-        set_seed(seed)
-        episode_rewards = []
-        
-        for ep in range(num_episodes):
-            env = MultiClassroomEnv(
-                num_classrooms=self.num_classrooms,
-                total_students=self.total_students,
-                max_weeks=MAX_WEEKS,
-                gamma=self.omega,
-                continuous_action=True,
-                cooperative_reward=True,
-                eval_mode=True,
-                community_risk_data_file=COMMUNITY_RISK_FILE
-            )
-            
-            obs = env.reset()
-            agent_ids = sorted(env.agents)
-            
-            ep_reward = 0
-            done = False
-            
-            while not done:
-                actions_for_env = {
-                    aid: np.array([np.random.rand() * self.total_students])
-                    for aid in agent_ids
-                }
-                
-                obs, rewards, dones, _ = env.step(actions_for_env)
-                ep_reward += sum(rewards.values()) / len(agent_ids)
-                done = any(dones.values())
-            
-            episode_rewards.append(ep_reward)
-        
-        return np.mean(episode_rewards), np.std(episode_rewards), episode_rewards
+    name = 'random'
+
+    def available(self):
+        return True
+
+    def act(self, env, obs, agent_ids, omega):
+        return {aid: np.array([np.random.rand() * env.total_students]) for aid in agent_ids}
 
 
-# ============================================================
-# RL MODEL EVALUATION
-# ============================================================
+class JointMyopicPolicy:
+    """Full-state 1-step greedy over a discrete joint action grid (full-info regime)."""
+    name = 'joint_myopic'
 
-def evaluate_ctde_model(
-    omega: float, 
-    num_episodes: int = NUM_EVAL_EPISODES, 
-    seed: int = EVAL_SEED
-) -> Tuple[Optional[float], Optional[float], Optional[List[float]]]:
-    """Load and evaluate trained CTDE model."""
-    try:
+    def __init__(self, n_action_bins=N_ACTION_BINS):
+        self.grid = np.linspace(0, TOTAL_STUDENTS, n_action_bins)
+        self._scratch = make_env(0.5)  # reused; gamma set per-call below
+
+    def available(self):
+        return True
+
+    def _scratch_at(self, env, omega):
+        s = self._scratch
+        s.gamma = omega
+        s.student_status = list(env.student_status)
+        s.current_week = env.current_week
+        s.shared_community_risk = list(env.shared_community_risk)
+        return s
+
+    def act(self, env, obs, agent_ids, omega):
+        from itertools import product
+        best_r, best_a = -np.inf, None
+        for combo in product(self.grid, repeat=len(agent_ids)):
+            s = self._scratch_at(env, omega)
+            acts = {aid: np.array([combo[i]]) for i, aid in enumerate(agent_ids)}
+            _, rewards, _, _ = s.step(acts)
+            r = rewards[agent_ids[0]]  # cooperative -> shared
+            if r > best_r:
+                best_r, best_a = r, combo
+        return {aid: np.array([best_a[i]]) for i, aid in enumerate(agent_ids)}
+
+
+class DecentralizedMyopicPolicy:
+    """
+    Per-room 1-step greedy on the room's OWN state only (local-info regime).
+
+    Each room cannot see its neighbors, so it optimizes against a single-classroom
+    model of itself (no coupling). The independently chosen actions are then applied
+    to the true coupled environment. This is the matched in-regime baseline for CTDE.
+    """
+    name = 'dec_myopic'
+
+    def __init__(self, n_action_bins=N_ACTION_BINS):
+        self.grid = np.linspace(0, TOTAL_STUDENTS, n_action_bins)
+        self._sim = MultiClassroomEnv(
+            num_classrooms=1, total_students=TOTAL_STUDENTS, max_weeks=MAX_WEEKS,
+            gamma=0.5, continuous_action=True, cooperative_reward=True, eval_mode=False)
+
+    def available(self):
+        return True
+
+    def act(self, env, obs, agent_ids, omega):
+        risk = current_risk(env)
+        self._sim.gamma = omega
+        self._sim.shared_community_risk = [risk] * MAX_WEEKS
+        actions = {}
+        for i, aid in enumerate(agent_ids):
+            infected_i = env.student_status[i]
+            best_r, best_a = -np.inf, 0.0
+            for a in self.grid:
+                self._sim.student_status = [infected_i]
+                self._sim.current_week = 0
+                _, rewards, _, _ = self._sim.step({'classroom_0': np.array([a])})
+                r = rewards['classroom_0']
+                if r > best_r:
+                    best_r, best_a = r, a
+            actions[aid] = np.array([best_a])
+        return actions
+
+
+class CentralizedPolicy:
+    """Trained centralized controller (full-info regime)."""
+    name = 'centralized'
+
+    def __init__(self, omega):
+        self.model = _load_centralized(omega)
+
+    def available(self):
+        return self.model is not None
+
+    def act(self, env, obs, agent_ids, omega):
         import torch
-        
-        # Try different import paths
-        try:
-            from mappo_ctde_beta import MAPPO_CTDE, normalize_state
-        except ImportError:
-            try:
-                from ppo_ctde import MAPPO_CTDE, normalize_state
-            except ImportError:
-                print("    Could not import CTDE module")
-                return None, None, None
-        
-        model_path = f"mappo_results_3_classrooms/models/mappo_omega_{omega}_run_0"
-        if not os.path.exists(model_path + '.pt'):
-            print(f"    CTDE model not found: {model_path}.pt")
-            return None, None, None
-        
-        model = MAPPO_CTDE.load(model_path)
-        device = torch.device("cpu")
-        
-        set_seed(seed)
-        episode_rewards = []
-        
-        for ep in range(num_episodes):
-            env = MultiClassroomEnv(
-                num_classrooms=NUM_CLASSROOMS,
-                total_students=TOTAL_STUDENTS,
-                max_weeks=MAX_WEEKS,
-                gamma=omega,
-                continuous_action=True,
-                cooperative_reward=True,
-                eval_mode=True,
-                community_risk_data_file=COMMUNITY_RISK_FILE
-            )
-            
-            obs = env.reset()
-            agent_ids = sorted(env.agents)
-            
-            ep_reward = 0
-            done = False
-            
-            while not done:
-                actions_for_env = {}
-                for i, aid in enumerate(agent_ids):
-                    state = normalize_state(obs[aid], TOTAL_STUDENTS)
-                    state_tensor = torch.FloatTensor(state).unsqueeze(0).to(device)
-                    with torch.no_grad():
-                        action = model.actors[i].get_deterministic_action(state_tensor)
-                    actions_for_env[aid] = action.cpu().numpy().flatten() * TOTAL_STUDENTS
-                
-                obs, rewards, dones, _ = env.step(actions_for_env)
-                ep_reward += sum(rewards.values()) / len(agent_ids)
-                done = any(dones.values())
-            
-            episode_rewards.append(ep_reward)
-        
-        return np.mean(episode_rewards), np.std(episode_rewards), episode_rewards
-    
-    except Exception as e:
-        print(f"    Warning: Could not evaluate CTDE model: {e}")
-        return None, None, None
+        gstate = []
+        for aid in agent_ids:
+            gstate.append(obs[aid][0] / env.total_students)
+            gstate.append(obs[aid][1])
+        st = torch.FloatTensor(np.array(gstate, dtype=np.float32)).unsqueeze(0)
+        with torch.no_grad():
+            ja = self.model.actor.get_deterministic_action(st).cpu().numpy().flatten()
+        return {aid: np.array([ja[i] * env.total_students]) for i, aid in enumerate(agent_ids)}
 
 
-def evaluate_centralized_model(
-    omega: float, 
-    num_episodes: int = NUM_EVAL_EPISODES, 
-    seed: int = EVAL_SEED
-) -> Tuple[Optional[float], Optional[float], Optional[List[float]]]:
-    """Load and evaluate trained Centralized model."""
-    try:
+class CTDEPolicy:
+    """Trained decentralized actors (local-info regime)."""
+    name = 'ctde'
+
+    def __init__(self, omega):
+        self.model, self.normalize = _load_ctde(omega)
+
+    def available(self):
+        return self.model is not None
+
+    def act(self, env, obs, agent_ids, omega):
         import torch
+        actions = {}
+        for i, aid in enumerate(agent_ids):
+            s = self.normalize(obs[aid], env.total_students)
+            st = torch.FloatTensor(s).unsqueeze(0)
+            with torch.no_grad():
+                a = self.model.actors[i].get_deterministic_action(st)
+            actions[aid] = a.cpu().numpy().flatten() * env.total_students
+        return actions
+
+
+# ---- trained-model loaders (graceful: return None if not found) ----
+
+def _resolve_model_path(results_dir, prefix, omega):
+    hp_file = os.path.join(results_dir, "optimized_hyperparams.json")
+    hidden_dim = 64
+    if os.path.exists(hp_file):
+        with open(hp_file) as f:
+            hp = json.load(f)
+        if str(float(omega)) in hp:
+            hidden_dim = hp[str(float(omega))].get('hidden_dim', 64)
+    p = os.path.join(results_dir, "models", f"{prefix}_omega_{omega}_hd_{hidden_dim}_run_0")
+    if os.path.exists(p + '.pt'):
+        return p
+    p_old = os.path.join(results_dir, "models", f"{prefix}_omega_{omega}_run_0")
+    return p_old if os.path.exists(p_old + '.pt') else None
+
+
+def _load_centralized(omega):
+    try:
         from ppo_centralized import CentralizedPPO
-        
-        model_path = f"centralized_ppo_results/models/centralized_omega_{omega}_run_0"
-        if not os.path.exists(model_path + '.pt'):
-            print(f"    Centralized model not found: {model_path}.pt")
-            return None, None, None
-        
-        model = CentralizedPPO.load(model_path)
-        device = torch.device("cpu")
-        
-        set_seed(seed)
-        episode_rewards = []
-        
-        for ep in range(num_episodes):
-            env = MultiClassroomEnv(
-                num_classrooms=NUM_CLASSROOMS,
-                total_students=TOTAL_STUDENTS,
-                max_weeks=MAX_WEEKS,
-                gamma=omega,
-                continuous_action=True,
-                cooperative_reward=True,
-                eval_mode=True,
-                community_risk_data_file=COMMUNITY_RISK_FILE
-            )
-            
-            obs = env.reset()
-            agent_ids = sorted(env.agents)
-            
-            # Build global state
-            global_state = []
-            for aid in agent_ids:
-                global_state.append(obs[aid][0] / TOTAL_STUDENTS)
-                global_state.append(obs[aid][1])
-            global_state = np.array(global_state, dtype=np.float32)
-            
-            ep_reward = 0
-            done = False
-            
-            while not done:
-                state_tensor = torch.FloatTensor(global_state).unsqueeze(0).to(device)
-                with torch.no_grad():
-                    joint_action = model.actor.get_deterministic_action(state_tensor)
-                joint_action = joint_action.cpu().numpy().flatten()
-                
-                actions_for_env = {
-                    aid: np.array([joint_action[i] * TOTAL_STUDENTS])
-                    for i, aid in enumerate(agent_ids)
-                }
-                
-                obs, rewards, dones, _ = env.step(actions_for_env)
-                ep_reward += sum(rewards.values()) / len(agent_ids)
-                
-                # Update global state
-                global_state = []
-                for aid in agent_ids:
-                    global_state.append(obs[aid][0] / TOTAL_STUDENTS)
-                    global_state.append(obs[aid][1])
-                global_state = np.array(global_state, dtype=np.float32)
-                
-                done = any(dones.values())
-            
-            episode_rewards.append(ep_reward)
-        
-        return np.mean(episode_rewards), np.std(episode_rewards), episode_rewards
-    
+        path = _resolve_model_path("centralized_ppo_results", "centralized", omega)
+        if path is None:
+            return None
+        return CentralizedPPO.load(path)
     except Exception as e:
-        print(f"    Warning: Could not evaluate Centralized model: {e}")
-        return None, None, None
+        print(f"    Centralized load failed (omega={omega}): {e}")
+        return None
+
+
+def _load_ctde(omega):
+    try:
+        import importlib
+        mod = None
+        for name in ("ppo_ctde", "mappo_ctde_beta"):
+            try:
+                mod = importlib.import_module(name)
+                break
+            except ImportError:
+                continue
+        if mod is None:
+            return None, None
+        path = _resolve_model_path("mappo_results", "mappo", omega)
+        if path is None:
+            return None, None
+        return mod.MAPPO_CTDE.load(path), mod.normalize_state
+    except Exception as e:
+        print(f"    CTDE load failed (omega={omega}): {e}")
+        return None, None
 
 
 # ============================================================
-# MAIN ANALYSIS
+# DP UPPER BOUND (per-scenario, perfect foresight of the risk path)
 # ============================================================
 
-def run_full_analysis():
-    """Run comprehensive analysis for all omega values."""
-    print("=" * 80)
-    print("COMPREHENSIVE ENVIRONMENT ANALYSIS")
-    print("Multi-Classroom Epidemic Control")
-    print("=" * 80)
-    print(f"Classrooms: {NUM_CLASSROOMS}, Students: {TOTAL_STUDENTS}, Horizon: {MAX_WEEKS}")
-    print(f"Omega values: {OMEGA_VALUES}")
-    print()
-    
+class DPUpperBound:
+    """On-demand discrete-action DP with memoization, for a FIXED risk trajectory."""
+    name = 'dp'
+
+    def __init__(self, omega, risk_vector, num_classrooms=NUM_CLASSROOMS,
+                 total_students=TOTAL_STUDENTS, max_weeks=MAX_WEEKS, n_action_bins=N_ACTION_BINS):
+        self.omega = omega
+        self.risk_vector = list(risk_vector)
+        self.num_classrooms = num_classrooms
+        self.max_weeks = max_weeks
+        self.action_vals = np.linspace(0, total_students, n_action_bins)
+        self.value_cache = {}
+        self.policy_cache = {}
+        self._sim = MultiClassroomEnv(
+            num_classrooms=num_classrooms, total_students=total_students, max_weeks=max_weeks,
+            gamma=omega, continuous_action=True, cooperative_reward=True, eval_mode=False)
+        self._aids = sorted(self._sim.agents)
+
+    def available(self):
+        return True
+
+    def _simulate_step(self, infected, actions, week):
+        self._sim.student_status = list(infected)
+        self._sim.current_week = week
+        self._sim.shared_community_risk = self.risk_vector
+        acts = {self._aids[i]: np.array([actions[i]]) for i in range(self.num_classrooms)}
+        _, rewards, _, _ = self._sim.step(acts)
+        return list(self._sim.student_status), rewards[self._aids[0]]
+
+    def get_value(self, state, t):
+        if t >= self.max_weeks:
+            return 0.0
+        key = (*state, t)
+        if key in self.value_cache:
+            return self.value_cache[key]
+        from itertools import product
+        best_v, best_a = -np.inf, None
+        for combo in product(self.action_vals, repeat=self.num_classrooms):
+            nxt, r = self._simulate_step(list(state), combo, t)
+            q = r + self.get_value(tuple(nxt), t + 1)
+            if q > best_v:
+                best_v, best_a = q, combo
+        self.value_cache[key] = best_v
+        self.policy_cache[key] = best_a
+        return best_v
+
+    def act(self, env, obs, agent_ids, omega):
+        state = tuple(int(round(x)) for x in env.student_status)
+        t = env.current_week
+        if (*state, t) not in self.value_cache:
+            self.get_value(state, t)
+        a = self.policy_cache[(*state, t)]
+        return {aid: np.array([a[i]]) for i, aid in enumerate(agent_ids)}
+
+
+# ============================================================
+# ROLLOUT
+# ============================================================
+
+def run_episode(omega, scenario_seed, risk_override, policy):
+    """Run one deterministic-policy episode; returns reward + per-week diagnostics."""
+    env = make_env(omega)
+    obs = env.reset(seed=scenario_seed, risk_override=risk_override)
+    agent_ids = sorted(env.agents)
+
+    total_reward = 0.0
+    admitted, infected = [], []
+    done = False
+    while not done:
+        actions = policy.act(env, obs, agent_ids, omega)
+        obs, rewards, dones, _ = env.step(actions)
+        total_reward += rewards[agent_ids[0]]  # cooperative -> shared
+        admitted.append(float(sum(env.allowed_students)))
+        infected.append(float(sum(env.student_status)))
+        done = any(dones.values())
+
+    return {'reward': total_reward, 'admitted': admitted, 'infected': infected}
+
+
+# ============================================================
+# STATISTICS (bootstrap, no scipy)
+# ============================================================
+
+def bootstrap_ci(values, n_boot=N_BOOT, alpha=0.05):
+    values = np.asarray(values, dtype=float)
+    if len(values) < 2:
+        m = float(values.mean()) if len(values) else 0.0
+        return m, m, m
+    idx = np.random.randint(0, len(values), size=(n_boot, len(values)))
+    means = values[idx].mean(axis=1)
+    return float(values.mean()), float(np.percentile(means, 100 * alpha / 2)), \
+        float(np.percentile(means, 100 * (1 - alpha / 2)))
+
+
+def paired_bootstrap(a_by_seed, b_by_seed, n_boot=N_BOOT):
+    """Paired diff (a - b) over shared seeds: mean, 95% CI, two-sided bootstrap p."""
+    seeds = sorted(set(a_by_seed) & set(b_by_seed))
+    if len(seeds) < 2:
+        return None
+    diffs = np.array([a_by_seed[s] - b_by_seed[s] for s in seeds], dtype=float)
+    idx = np.random.randint(0, len(diffs), size=(n_boot, len(diffs)))
+    bmeans = diffs[idx].mean(axis=1)
+    p = 2.0 * min((bmeans <= 0).mean(), (bmeans >= 0).mean())
+    return {
+        'mean': float(diffs.mean()),
+        'ci_lo': float(np.percentile(bmeans, 2.5)),
+        'ci_hi': float(np.percentile(bmeans, 97.5)),
+        'p_value': float(min(1.0, p)),
+        'n': len(seeds),
+    }
+
+
+# ============================================================
+# EVALUATION DRIVER
+# ============================================================
+
+def evaluate(families, omegas=OMEGA_VALUES, k=K_SCENARIOS, dp_k=DP_SCENARIOS):
+    """
+    Returns results[family][omega][method] = {
+        'by_seed': {seed: reward}, 'rewards': [...], 'mean','ci_lo','ci_hi',
+        'admitted': mean weekly vector, 'infected': mean weekly vector,
+        'cum_admitted': float, 'cum_infected': float,
+    }
+    """
     results = {}
-    
-    for omega in OMEGA_VALUES:
-        print(f"\n{'=' * 80}")
-        print(f"OMEGA = {omega}")
-        print("=" * 80)
-        
-        results[omega] = {}
-        
-        # # 1. DP Upper Bound
-        # print("\n[1] Computing DP Upper Bound...")
-        # dp_solver = DPUpperBound(
-        #     omega=omega,
-        #     num_classrooms=NUM_CLASSROOMS,
-        #     n_infected_bins=N_INFECTED_BINS,
-        #     n_action_bins=N_ACTION_BINS
-        # )
-        # dp_solver.solve(verbose=True)
-        
-        # print("  Evaluating DP policy...")
-        # dp_mean, dp_std, _ = dp_solver.evaluate()
-        # results[omega]['dp'] = {'mean': dp_mean, 'std': dp_std}
-        # print(f"  DP Reward: {dp_mean:.2f} ± {dp_std:.2f}")
-        
-        # 2. Myopic Optimal
-        print("\n[2] Evaluating Myopic Optimal...")
-        myopic = MyopicAgent(omega=omega, num_classrooms=NUM_CLASSROOMS)
-        myopic_mean, myopic_std, _ = myopic.evaluate()
-        results[omega]['myopic'] = {'mean': myopic_mean, 'std': myopic_std}
-        print(f"  Myopic Reward: {myopic_mean:.2f} ± {myopic_std:.2f}")
-        
-        # 3. CTDE
-        print("\n[3] Evaluating CTDE (MAPPO)...")
-        ctde_mean, ctde_std, _ = evaluate_ctde_model(omega)
-        if ctde_mean is not None:
-            results[omega]['ctde'] = {'mean': ctde_mean, 'std': ctde_std}
-            print(f"  CTDE Reward: {ctde_mean:.2f} ± {ctde_std:.2f}")
-        else:
-            results[omega]['ctde'] = None
-            print("  CTDE: Model not found")
-        
-        # 4. Centralized
-        print("\n[4] Evaluating Centralized PPO...")
-        cent_mean, cent_std, _ = evaluate_centralized_model(omega)
-        if cent_mean is not None:
-            results[omega]['centralized'] = {'mean': cent_mean, 'std': cent_std}
-            print(f"  Centralized Reward: {cent_mean:.2f} ± {cent_std:.2f}")
-        else:
-            results[omega]['centralized'] = None
-            print("  Centralized: Model not found")
-        
-        # 5. Random
-        print("\n[5] Evaluating Random...")
-        random_policy = RandomPolicy(omega=omega)
-        random_mean, random_std, _ = random_policy.evaluate()
-        results[omega]['random'] = {'mean': random_mean, 'std': random_std}
-        print(f"  Random Reward: {random_mean:.2f} ± {random_std:.2f}")
-    
-    # Generate outputs
-    generate_summary_table(results)
-    generate_comparison_plot(results)
-    save_results(results)
-    
+    for fam, spec in families.items():
+        seeds = spec['seeds'][:k]
+        risk = spec['risk']
+        results[fam] = {}
+        print(f"\n{'#' * 70}\nFAMILY: {fam}  (K={len(seeds)} scenarios)\n{'#' * 70}")
+
+        for omega in omegas:
+            print(f"\n=== omega = {omega} ===")
+            results[fam][omega] = {}
+
+            # Build policies once per omega (models loaded once)
+            policies = {
+                'random': RandomPolicy(),
+                'joint_myopic': JointMyopicPolicy(),
+                'dec_myopic': DecentralizedMyopicPolicy(),
+                'centralized': CentralizedPolicy(omega),
+                'ctde': CTDEPolicy(omega),
+            }
+
+            for mname, policy in policies.items():
+                if not policy.available():
+                    print(f"  {LEAGUE[mname][0]:<24}: model not found, skipped")
+                    results[fam][omega][mname] = None
+                    continue
+                _eval_method(results, fam, omega, mname, policy, seeds, risk)
+
+            # DP: per-scenario solve on a subset (expensive)
+            dp_seeds = seeds[:dp_k]
+            by_seed, traj_adm, traj_inf = {}, [], []
+            t0 = time.time()
+            for s in dp_seeds:
+                # DP needs the exact risk path of this scenario
+                scen_risk = risk if risk is not None else _scenario_risk(s)
+                dp = DPUpperBound(omega, scen_risk)
+                out = run_episode(omega, s, risk, dp)
+                by_seed[s] = out['reward']
+                traj_adm.append(out['admitted'])
+                traj_inf.append(out['infected'])
+            results[fam][omega]['dp'] = _summarize(by_seed, traj_adm, traj_inf)
+            print(f"  {LEAGUE['dp'][0]:<24}: {results[fam][omega]['dp']['mean']:.1f} "
+                  f"(subset n={len(dp_seeds)}, {time.time() - t0:.0f}s)")
+
     return results
 
 
-def generate_summary_table(results: Dict):
-    """Generate and print summary table."""
-    print("\n" + "=" * 100)
-    print("SUMMARY TABLE")
-    print("=" * 100)
-    
-    rows = []
-    for omega in OMEGA_VALUES:
-        r = results[omega]
-        row = {
-            'omega': omega,
-            # 'dp_mean': r['dp']['mean'],
-            # 'dp_std': r['dp']['std'],
-            'myopic_mean': r['myopic']['mean'],
-            'myopic_std': r['myopic']['std'],
-            'centralized_mean': r['centralized']['mean'] if r.get('centralized') else np.nan,
-            'centralized_std': r['centralized']['std'] if r.get('centralized') else np.nan,
-            'ctde_mean': r['ctde']['mean'] if r.get('ctde') else np.nan,
-            'ctde_std': r['ctde']['std'] if r.get('ctde') else np.nan,
-            'random_mean': r['random']['mean'],
-            'random_std': r['random']['std']
-        }
-        rows.append(row)
-        
-        cent_str = f"{row['centralized_mean']:.1f}" if not np.isnan(row['centralized_mean']) else "N/A"
-        ctde_str = f"{row['ctde_mean']:.1f}" if not np.isnan(row['ctde_mean']) else "N/A"
-        
-        print(f"ω={omega}: "
-              f"Myopic={row['myopic_mean']:.1f}±{row['myopic_std']:.1f}, "
-              f"Cent={cent_str}, CTDE={ctde_str}, "
-              f"Random={row['random_mean']:.1f}")
-    
-    # Save to CSV
-    df = pd.DataFrame(rows)
-    csv_path = os.path.join(OUTPUT_DIR, "analysis_results.csv")
-    df.to_csv(csv_path, index=False)
-    print(f"\nResults saved to {csv_path}")
+def _scenario_risk(seed):
+    """Recover the synthetic risk path a given seed produces (for DP foresight)."""
+    env = make_env(0.5)
+    env.reset(seed=seed)
+    return list(env.shared_community_risk)
 
 
-def generate_comparison_plot(results: Dict):
-    """Generate comparison bar chart."""
-    print("\n--- Generating Comparison Plot ---")
-    
-    fig, ax = plt.subplots(figsize=(14, 6))
-    
-    x = np.arange(len(OMEGA_VALUES))
-    width = 0.15
-    
-    methods = ['myopic', 'centralized', 'ctde', 'random']
-    colors = ['forestgreen', 'steelblue', 'coral', 'gray']
-    labels = ['Myopic', 'Centralized', 'CTDE', 'Random']
-    
-    for i, (method, color, label) in enumerate(zip(methods, colors, labels)):
-        means = []
-        stds = []
-        for omega in OMEGA_VALUES:
-            if results[omega].get(method) and results[omega][method] is not None:
-                means.append(results[omega][method]['mean'])
-                stds.append(results[omega][method]['std'])
-            else:
-                means.append(0)
-                stds.append(0)
-        
-        offset = (i - len(methods) / 2 + 0.5) * width
-        ax.bar(x + offset, means, width, yerr=stds, label=label, color=color, capsize=2)
-    
-    ax.set_xlabel('Omega (ω)', fontweight='bold')
-    ax.set_ylabel('Reward', fontweight='bold')
-    ax.set_title('Performance Comparison: Multi-Classroom Epidemic Control', fontweight='bold')
-    ax.set_xticks(x)
-    ax.set_xticklabels([f'{o}' for o in OMEGA_VALUES])
-    ax.legend(loc='upper left')
-    ax.grid(axis='y', linestyle='--', alpha=0.6)
-    
+def _eval_method(results, fam, omega, mname, policy, seeds, risk):
+    by_seed, traj_adm, traj_inf = {}, [], []
+    for s in seeds:
+        out = run_episode(omega, s, risk, policy)
+        by_seed[s] = out['reward']
+        traj_adm.append(out['admitted'])
+        traj_inf.append(out['infected'])
+    results[fam][omega][mname] = _summarize(by_seed, traj_adm, traj_inf)
+    print(f"  {LEAGUE[mname][0]:<24}: {results[fam][omega][mname]['mean']:.1f} "
+          f"[{results[fam][omega][mname]['ci_lo']:.1f}, {results[fam][omega][mname]['ci_hi']:.1f}]")
+
+
+def _summarize(by_seed, traj_adm, traj_inf):
+    rewards = list(by_seed.values())
+    mean, lo, hi = bootstrap_ci(rewards)
+    adm = np.array(traj_adm, dtype=float)
+    inf = np.array(traj_inf, dtype=float)
+    return {
+        'by_seed': by_seed,
+        'rewards': rewards,
+        'mean': mean, 'ci_lo': lo, 'ci_hi': hi,
+        'admitted': adm.mean(axis=0).tolist(),
+        'infected': inf.mean(axis=0).tolist(),
+        'cum_admitted': float(adm.sum(axis=1).mean()),
+        'cum_infected': float(inf.sum(axis=1).mean()),
+    }
+
+
+# ============================================================
+# DECOMPOSITIONS
+# ============================================================
+
+def compute_decompositions(results):
+    """Named, paired cross/within-regime gaps per family/omega."""
+    pairs = {
+        'price_of_decentralization': ('centralized', 'ctde'),   # cross-regime
+        'optimality_gap':            ('dp', 'centralized'),     # within full-info
+        'value_of_lookahead':        ('centralized', 'joint_myopic'),
+        'ctde_vs_dec_myopic':        ('ctde', 'dec_myopic'),    # within local-info
+    }
+    decomp = {}
+    for fam in results:
+        decomp[fam] = {}
+        for omega in results[fam]:
+            decomp[fam][omega] = {}
+            for label, (a, b) in pairs.items():
+                ra = results[fam][omega].get(a)
+                rb = results[fam][omega].get(b)
+                if ra is None or rb is None:
+                    decomp[fam][omega][label] = None
+                    continue
+                decomp[fam][omega][label] = paired_bootstrap(ra['by_seed'], rb['by_seed'])
+    return decomp
+
+
+# ============================================================
+# PLOTS
+# ============================================================
+
+def _omega_x(omegas):
+    return np.arange(len(omegas)), [f'{o}' for o in omegas]
+
+
+def plot_rewards_by_league(results, fam, omegas=OMEGA_VALUES):
+    x, xlabels = _omega_x(omegas)
+    fig, ax = plt.subplots(figsize=(10, 6))
+    for mname in ALL_METHODS:
+        label, league, color = LEAGUE[mname]
+        means, los, his, xs = [], [], [], []
+        for i, o in enumerate(omegas):
+            r = results[fam][o].get(mname)
+            if r is None:
+                continue
+            xs.append(i); means.append(r['mean']); los.append(r['ci_lo']); his.append(r['ci_hi'])
+        if not xs:
+            continue
+        ls = '-' if league == 'full_info' else ('--' if league == 'local_info' else ':')
+        ax.plot(xs, means, ls, marker='o', color=color, label=label, linewidth=2.2)
+        ax.fill_between(xs, los, his, color=color, alpha=0.15)
+    ax.set_xticks(x); ax.set_xticklabels(xlabels)
+    ax.set_xlabel('Omega (ω)'); ax.set_ylabel('Episode Reward')
+    ax.set_title(f'Reward by Method — {fam} scenarios\n'
+                 'solid = full-info, dashed = local-info, dotted = floor', fontsize=12)
+    ax.grid(True, linestyle='--', alpha=0.5)
+    ax.legend(loc='best', fontsize=10)
     plt.tight_layout()
-    plot_path = os.path.join(OUTPUT_DIR, "performance_comparison.png")
-    plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+    plt.savefig(os.path.join(OUTPUT_DIR, f"rewards_by_league_{fam}.png"), dpi=300, bbox_inches='tight')
     plt.close()
-    print(f"Plot saved to {plot_path}")
 
 
-def save_results(results: Dict):
-    """Save results to JSON."""
-    serializable = {}
-    for omega in OMEGA_VALUES:
-        serializable[str(omega)] = {}
-        for method in [ 'myopic', 'centralized', 'ctde', 'random']:
-            if results[omega].get(method) and results[omega][method] is not None:
-                serializable[str(omega)][method] = {
-                    'mean': float(results[omega][method]['mean']),
-                    'std': float(results[omega][method]['std'])
+def plot_normalized_score(results, fam, omegas=OMEGA_VALUES):
+    """Fraction of full-info optimal recovered: (return - Random)/(DP - Random)."""
+    x, xlabels = _omega_x(omegas)
+    fig, ax = plt.subplots(figsize=(10, 6))
+    for mname in ['centralized', 'joint_myopic', 'ctde', 'dec_myopic']:
+        label, league, color = LEAGUE[mname]
+        xs, ys = [], []
+        for i, o in enumerate(omegas):
+            r = results[fam][o].get(mname)
+            dp = results[fam][o].get('dp')
+            rnd = results[fam][o].get('random')
+            if r is None or dp is None or rnd is None:
+                continue
+            denom = dp['mean'] - rnd['mean']
+            if abs(denom) < 1e-9:
+                continue
+            xs.append(i); ys.append((r['mean'] - rnd['mean']) / denom)
+        if not xs:
+            continue
+        ls = '-' if league == 'full_info' else '--'
+        ax.plot(xs, ys, ls, marker='o', color=color, label=label, linewidth=2.2)
+    ax.axhline(1.0, color='gold', linestyle=':', alpha=0.7, label='DP optimal')
+    ax.axhline(0.0, color='gray', linestyle=':', alpha=0.7, label='Random floor')
+    ax.set_xticks(x); ax.set_xticklabels(xlabels)
+    ax.set_xlabel('Omega (ω)'); ax.set_ylabel('Fraction of full-info optimal')
+    ax.set_title(f'Fraction of full-info optimal recovered — {fam}\n'
+                 '(local-info shortfall includes the price of decentralization)', fontsize=12)
+    ax.grid(True, linestyle='--', alpha=0.5)
+    ax.legend(loc='best', fontsize=10)
+    plt.tight_layout()
+    plt.savefig(os.path.join(OUTPUT_DIR, f"normalized_score_{fam}.png"), dpi=300, bbox_inches='tight')
+    plt.close()
+
+
+def plot_decomposition(decomp, fam, omegas=OMEGA_VALUES):
+    x, xlabels = _omega_x(omegas)
+    labels = {
+        'price_of_decentralization': ('Price of decentralization (Cent - CTDE)', 'crimson'),
+        'optimality_gap':            ('Optimality gap (DP - Cent)', 'goldenrod'),
+        'value_of_lookahead':        ('Value of lookahead (Cent - Myopic)', 'teal'),
+    }
+    fig, ax = plt.subplots(figsize=(10, 6))
+    for key, (label, color) in labels.items():
+        xs, means, errlo, errhi = [], [], [], []
+        for i, o in enumerate(omegas):
+            d = decomp[fam][o].get(key)
+            if d is None:
+                continue
+            xs.append(i); means.append(d['mean'])
+            errlo.append(d['mean'] - d['ci_lo']); errhi.append(d['ci_hi'] - d['mean'])
+        if not xs:
+            continue
+        ax.errorbar(xs, means, yerr=[errlo, errhi], marker='o', color=color,
+                    label=label, linewidth=2.2, capsize=3)
+    ax.axhline(0.0, color='black', linewidth=1, alpha=0.6)
+    ax.set_xticks(x); ax.set_xticklabels(xlabels)
+    ax.set_xlabel('Omega (ω)'); ax.set_ylabel('Reward difference')
+    ax.set_title(f'Reward decompositions (paired, 95% CI) — {fam}', fontsize=12)
+    ax.grid(True, linestyle='--', alpha=0.5)
+    ax.legend(loc='best', fontsize=10)
+    plt.tight_layout()
+    plt.savefig(os.path.join(OUTPUT_DIR, f"decomposition_{fam}.png"), dpi=300, bbox_inches='tight')
+    plt.close()
+
+
+def plot_reward_terms(results, fam, omegas=OMEGA_VALUES):
+    """The two reward terms vs omega: cumulative admitted (utility) and infected (cost)."""
+    x, xlabels = _omega_x(omegas)
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    for term, ax, ylab in [('cum_admitted', axes[0], 'Cumulative admitted (utility)'),
+                           ('cum_infected', axes[1], 'Cumulative infected (cost)')]:
+        for mname in ALL_METHODS:
+            label, league, color = LEAGUE[mname]
+            xs, ys = [], []
+            for i, o in enumerate(omegas):
+                r = results[fam][o].get(mname)
+                if r is None:
+                    continue
+                xs.append(i); ys.append(r[term])
+            if not xs:
+                continue
+            ls = '-' if league == 'full_info' else ('--' if league == 'local_info' else ':')
+            ax.plot(xs, ys, ls, marker='o', color=color, label=label, linewidth=2)
+        ax.set_xticks(x); ax.set_xticklabels(xlabels)
+        ax.set_xlabel('Omega (ω)'); ax.set_ylabel(ylab)
+        ax.grid(True, linestyle='--', alpha=0.5)
+    axes[0].legend(loc='best', fontsize=9)
+    fig.suptitle(f'Reward terms vs ω — {fam}', fontsize=13, fontweight='bold')
+    plt.tight_layout()
+    plt.savefig(os.path.join(OUTPUT_DIR, f"reward_terms_{fam}.png"), dpi=300, bbox_inches='tight')
+    plt.close()
+
+
+def plot_trajectories(results, fam, omegas=OMEGA_VALUES):
+    """Weekly admitted / infected curves (averaged over scenarios), per method, per ω."""
+    weeks = np.arange(MAX_WEEKS)
+    fig, axes = plt.subplots(2, len(omegas), figsize=(3.3 * len(omegas), 6.5), sharex=True)
+    if len(omegas) == 1:
+        axes = axes.reshape(2, 1)
+    for col, o in enumerate(omegas):
+        for mname in ALL_METHODS:
+            label, league, color = LEAGUE[mname]
+            r = results[fam][o].get(mname)
+            if r is None:
+                continue
+            ls = '-' if league == 'full_info' else ('--' if league == 'local_info' else ':')
+            axes[0, col].plot(weeks[:len(r['admitted'])], r['admitted'], ls, color=color, linewidth=1.8)
+            axes[1, col].plot(weeks[:len(r['infected'])], r['infected'], ls, color=color,
+                              linewidth=1.8, label=label)
+        axes[0, col].set_title(f'ω={o}')
+        axes[1, col].set_xlabel('Week')
+        if col == 0:
+            axes[0, col].set_ylabel('Admitted (sum)')
+            axes[1, col].set_ylabel('Infected (sum)')
+        for r_ in (0, 1):
+            axes[r_, col].grid(True, linestyle='--', alpha=0.4)
+    handles, labels_ = axes[1, 0].get_legend_handles_labels()
+    fig.legend(handles, labels_, loc='lower center', ncol=len(ALL_METHODS), fontsize=9,
+               frameon=False, bbox_to_anchor=(0.5, -0.04))
+    fig.suptitle(f'Behavior over time — {fam}  (admitted = utility, infected = cost)',
+                 fontsize=13, fontweight='bold')
+    plt.tight_layout(rect=[0, 0.02, 1, 1])
+    plt.savefig(os.path.join(OUTPUT_DIR, f"trajectories_{fam}.png"), dpi=300, bbox_inches='tight')
+    plt.close()
+
+
+# ============================================================
+# REPORTING
+# ============================================================
+
+def save_outputs(results, decomp, omegas=OMEGA_VALUES):
+    # CSV table
+    rows = []
+    for fam in results:
+        for o in omegas:
+            row = {'family': fam, 'omega': o}
+            for m in ALL_METHODS:
+                r = results[fam][o].get(m)
+                row[f'{m}_mean'] = r['mean'] if r else np.nan
+                row[f'{m}_ci_lo'] = r['ci_lo'] if r else np.nan
+                row[f'{m}_ci_hi'] = r['ci_hi'] if r else np.nan
+            for key in ('price_of_decentralization', 'optimality_gap', 'value_of_lookahead'):
+                d = decomp[fam][o].get(key)
+                row[f'{key}_mean'] = d['mean'] if d else np.nan
+                row[f'{key}_p'] = d['p_value'] if d else np.nan
+            rows.append(row)
+    df = pd.DataFrame(rows)
+    df.to_csv(os.path.join(OUTPUT_DIR, "diagnostic_results.csv"), index=False)
+
+    # JSON (drop per-seed/per-week bulk; keep summaries + decompositions)
+    out = {}
+    for fam in results:
+        out[fam] = {}
+        for o in omegas:
+            out[fam][str(o)] = {'methods': {}, 'decomp': {}}
+            for m in ALL_METHODS:
+                r = results[fam][o].get(m)
+                out[fam][str(o)]['methods'][m] = None if r is None else {
+                    'mean': r['mean'], 'ci_lo': r['ci_lo'], 'ci_hi': r['ci_hi'],
+                    'cum_admitted': r['cum_admitted'], 'cum_infected': r['cum_infected'],
                 }
-    
-    json_path = os.path.join(OUTPUT_DIR, "analysis_results.json")
-    with open(json_path, 'w') as f:
-        json.dump(serializable, f, indent=4)
-    print(f"Results saved to {json_path}")
+            for key, d in decomp[fam][o].items():
+                out[fam][str(o)]['decomp'][key] = d
+    with open(os.path.join(OUTPUT_DIR, "diagnostic_results.json"), 'w') as f:
+        json.dump(out, f, indent=2)
+    print(f"\nSaved table + json to {OUTPUT_DIR}/")
+
+
+def print_summary(results, decomp, omegas=OMEGA_VALUES):
+    for fam in results:
+        print(f"\n{'=' * 78}\nSUMMARY — {fam} scenarios\n{'=' * 78}")
+        for o in omegas:
+            parts = []
+            for m in ALL_METHODS:
+                r = results[fam][o].get(m)
+                parts.append(f"{m}={r['mean']:.1f}" if r else f"{m}=NA")
+            print(f"ω={o}: " + ", ".join(parts))
+            d = decomp[fam][o].get('price_of_decentralization')
+            if d:
+                sig = "*" if d['p_value'] < 0.05 else ""
+                print(f"       price of decentralization (Cent-CTDE) = "
+                      f"{d['mean']:.1f} [{d['ci_lo']:.1f}, {d['ci_hi']:.1f}] p={d['p_value']:.3f}{sig}")
 
 
 # ============================================================
 # MAIN
 # ============================================================
 
-if __name__ == "__main__":
-    results = run_full_analysis()
-    
-    print("\n" + "=" * 80)
-    print("ANALYSIS COMPLETE")
+def run_full_analysis(k=K_SCENARIOS, dp_k=DP_SCENARIOS, omegas=OMEGA_VALUES):
     print("=" * 80)
-    print(f"Results saved to {OUTPUT_DIR}/")
+    print("DIAGNOSTIC EVALUATION — Multi-Classroom Epidemic Control")
+    print(f"N={TOTAL_STUDENTS}, classrooms={NUM_CLASSROOMS}, horizon={MAX_WEEKS}, K={k}, DP_subset={dp_k}")
+    print("=" * 80)
+
+    families = build_scenarios(k)
+    results = evaluate(families, omegas=omegas, k=k, dp_k=dp_k)
+    decomp = compute_decompositions(results)
+
+    for fam in results:
+        plot_rewards_by_league(results, fam, omegas)
+        plot_normalized_score(results, fam, omegas)
+        plot_decomposition(decomp, fam, omegas)
+        plot_reward_terms(results, fam, omegas)
+        plot_trajectories(results, fam, omegas)
+
+    print_summary(results, decomp, omegas)
+    save_outputs(results, decomp, omegas)
+    return results, decomp
+
+
+if __name__ == "__main__":
+    run_full_analysis()
+    print("\n" + "=" * 80)
+    print(f"ANALYSIS COMPLETE — results in {OUTPUT_DIR}/")
+    print("=" * 80)
