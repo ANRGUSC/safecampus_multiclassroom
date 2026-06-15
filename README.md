@@ -1,167 +1,138 @@
-# SafeCampus MultiClassroom Project
+# SafeCampus MultiClassroom
 
-## Overview
-This project implements multi-agent reinforcement learning approaches to optimize classroom policies in a multi-classroom environment during an epidemic scenario. The system uses advanced PPO-based algorithms to learn policies that balance infection control with classroom attendance.
+Reinforcement learning for **epidemic-aware classroom capacity control**. Each week a
+controller decides how many students each classroom may admit, trading attendance (utility)
+against infections (cost) under a time-varying community risk. We study two RL controllers
+(centralized and CTDE) against optimal and myopic references.
 
-## Project Structure
-The project consists of the following main components:
+> The project is framed as an **RL/MARL methods study** that decomposes the difficulty of the
+> control problem into **foresight**, **coordination/observability**, and **scale**, each
+> measured against a perfect-foresight DP optimum. See **`EXPERIMENT_PLAN.docx`** for the full
+> research questions, hypotheses, and experiment matrix.
 
-- `environment/`: Contains the `MultiClassroomEnv` class, which simulates the multi-classroom epidemic environment
-  - `multiclassroom.py`: Main environment implementation
-  - `simulation.py`: Epidemic simulation logic
-- `ppo_centralized.py`: Centralized PPO implementation with a single controller for all classrooms
-- `ppo_ctde.py`: Multi-Agent PPO with Centralized Training and Decentralized Execution (MAPPO-CTDE)
-- `analyze_environment.py`: Comprehensive analysis tool for comparing different policies
-- `epidemic_model_analysis.py`: Additional epidemic model analysis utilities
+## Problem
+
+For `K` classrooms over `MAX_WEEKS` weeks, the per-room observation is `(infected, community
+risk)` where **risk is a shared exogenous signal**. Classrooms couple **only through shared
+students** (`shared_fraction`). The cooperative reward trades utility vs cost via preference ω:
+
+```
+r_i = ω · allowed_i − (1 − ω) · infected_i        (all agents share the mean reward)
+```
+
+Low ω prioritizes infection control; high ω prioritizes attendance. Sweeping ω traces the
+safety–utility frontier.
+
+## Project structure
+
+- `environment/`
+  - `multiclassroom.py` — `MultiClassroomEnv` (PettingZoo ParallelEnv). Supports a `risk_override`
+    on `reset()` to evaluate on a fixed/real risk path while still randomizing initial infections.
+  - `simulation.py` — infection dynamics (within-class + community-risk + cross-class coupling).
+- `ppo_centralized.py` — Centralized PPO: a single Beta-policy controller over the full joint state.
+- `ppo_ctde.py` — MAPPO-CTDE: decentralized Beta actors + a centralized critic.
+- `analyze_environment.py` — diagnostic evaluation harness (matched information regimes + decompositions).
+- `weekly_risk_sample_b.csv` — real weekly community-risk series (used by the "real" eval family).
+- `EXPERIMENT_PLAN.docx` — research plan (RQs, hypotheses, experiments).
 
 ## Installation
 
-1. Create a conda environment (recommended):
-   ```bash
-   conda create -n safecampus python=3.10
-   conda activate safecampus
-   ```
+```bash
+conda create -n safecampus python=3.10 && conda activate safecampus
+pip install -r requirements.txt
+```
 
-2. Install the required dependencies:
-   ```bash
-   pip install -r requirements.txt
-   ```
+## Shared environment config
 
-## Running the Agents
+All three scripts must agree on the env for results to be comparable:
+`TOTAL_STUDENTS=50`, `NUM_CLASSROOMS=2`, `MAX_WEEKS=15`, `cooperative_reward=True`,
+`shared_fraction=0.3`, `OMEGA_VALUES=[0.1, …, 0.6]`.
 
-### 1. PPO Centralized Training
-
-The centralized PPO agent uses a single controller that observes all classrooms and outputs actions for all of them.
+## 1. Train the centralized controller
 
 ```bash
 python ppo_centralized.py
 ```
 
-**Features:**
-- Single global policy network observing all classrooms
-- Tanh-deterministic actor with exploration noise
-- Automatic hyperparameter tuning for different omega values
-- Model checkpoints saved in `centralized_ppo_results/models/`
+- Single Beta-policy network over the full joint state (all rooms' infected + shared risk).
+- Reward-only hyperparameter selection (learning rate, hidden dim) per ω.
+- **Outputs:** training curve `centralized_ppo_results/training_rewards.png`; checkpoints
+  `centralized_ppo_results/models/centralized_omega_{ω}_hd_{hidden_dim}_run_0.pt`.
 
-**Configuration:**
-- Edit constants at the top of `ppo_centralized.py` to customize:
-  - `NUM_CLASSROOMS`: Number of classrooms (default: 2)
-  - `TOTAL_STUDENTS`: Total student population (default: 100)
-  - `OMEGA_VALUES`: Preference weights to train (default: [0.1, 0.2, 0.3, 0.4, 0.5, 0.6])
-  - `FULL_EPISODES`: Number of training episodes (default: 3000)
-
-**Output:**
-- Training reward curves: `centralized_ppo_results/training_rewards.png`
-- Policy visualizations: `centralized_ppo_results/policy_grids.png`
-- Monotonicity analysis: `centralized_ppo_results/monotonicity_summary.png`
-- Trained models: `centralized_ppo_results/models/`
-
-### 2. PPO CTDE (Centralized Training, Decentralized Execution)
-
-The MAPPO-CTDE agent trains decentralized policies for each classroom using a centralized critic.
+## 2. Train the CTDE controller
 
 ```bash
 python ppo_ctde.py
 ```
 
-**Features:**
-- Decentralized actors (one per classroom) with centralized critic
-- Beta distribution policy for naturally bounded actions
-- Option to use Tanh-deterministic policy (change `policy_type='tanh'` in main)
-- Independent learning during execution, coordinated during training
-- Model checkpoints saved in `mappo_results/models/`
+- Decentralized Beta actors (one per room, local obs only) with a shared centralized critic.
+- `policy_type` can be `'beta'` (default), `'gaussian'`, or `'tanh'` (set in `main()`).
+- **Outputs:** `mappo_results/combined_mappo_rewards_ci.png`,
+  `mappo_results/combined_mappo_optimal_policies.png`; checkpoints
+  `mappo_results/models/mappo_omega_{ω}_hd_{hidden_dim}_run_0.pt`.
 
-**Configuration:**
-- Edit constants at the top of `ppo_ctde.py` to customize:
-  - `NUM_CLASSROOMS`: Number of classrooms (default: 2)
-  - `POLICY_TYPE`: 'beta' or 'tanh' (set in main function)
-  - `OMEGA_VALUES`: Preference weights to train
-  - `FULL_EPISODES`: Number of training episodes
+### Training modes (both scripts, set in `main()`)
+- `tune` — reward-only hyperparameter search.
+- `train` — train with saved hyperparameters.
+- `tune_and_train` — both (recommended for a first run).
 
-**Output:**
-- Training reward curves: `mappo_results/combined_mappo_rewards_ci.png`
-- Policy visualizations: `mappo_results/combined_mappo_optimal_policies.png`
-- Monotonicity analysis: `mappo_results/monotonicity_summary.png`
-- Trained models: `mappo_results/models/`
-
-### 3. Environment Analysis
-
-Run comprehensive analysis comparing different policies including DP upper bound, myopic optimal, and trained RL models.
+## 3. Diagnostic evaluation
 
 ```bash
 python analyze_environment.py
 ```
 
-**Features:**
-- Dynamic Programming (Backward Induction) upper bound computation
-- Myopic optimal policy (one-step lookahead)
-- Evaluation of trained CTDE and Centralized models
-- Random baseline comparison
+Compares controllers **within matched information regimes** rather than as a flat ranking:
 
-**Configuration:**
-- Edit constants at the top of `analyze_environment.py`:
-  - `OUTPUT_DIR`: Directory for analysis results
-  - `OMEGA_VALUES`: Which omega values to analyze
-  - `NUM_EVAL_EPISODES`: Number of evaluation episodes (default: 30)
+| Regime | Methods |
+|---|---|
+| Full-info (full joint state) | DP (perfect-foresight ceiling), Joint-Myopic, **Centralized PPO** |
+| Local-info (own room only) | Dec-Myopic, **CTDE MAPPO** |
+| Floor | Random |
 
-**Output:**
-- Performance comparison plot: `analysis_results/performance_comparison.png`
-- Summary table: `analysis_results/analysis_results.csv`
-- Detailed results: `analysis_results/analysis_results.json`
+Evaluation runs over **K paired scenarios**, shared across methods, for two families:
+- **synthetic** — held-out seeds → sampled risk + random initial infections (in-distribution);
+- **real** — `weekly_risk_sample_b.csv` risk path fixed, initial infections varied over the seeds.
 
-## Training Modes
+Reward-only metrics with bootstrap 95% CIs, plus named, paired **decompositions**: price of
+decentralization (`Centralized − CTDE`), optimality gap (`DP − Centralized`), value of lookahead
+(`Centralized − Joint-Myopic`). RL rows are skipped gracefully if no checkpoints exist yet.
 
-Both PPO implementations support three training modes (set in the `main()` function):
+**Outputs** (per family `{synthetic, real}`):
+`rewards_by_league_{family}.png`, `normalized_score_{family}.png`, `decomposition_{family}.png`,
+`reward_terms_{family}.png`, `trajectories_{family}.png`, plus `diagnostic_results.csv` and
+`diagnostic_results.json`.
 
-- `mode='tune'`: Run hyperparameter tuning only (finds optimal learning rates)
-- `mode='train'`: Train with previously saved optimal learning rates
-- `mode='tune_and_train'`: Run tuning followed by full training (recommended for first run)
+Key knobs at the top of `analyze_environment.py`: `K_SCENARIOS` (paired eval scenarios),
+`DP_SCENARIOS` (DP subset, since DP is expensive), `N_ACTION_BINS` (DP/myopic action grid),
+`OMEGA_VALUES`.
 
-Example:
-```python
-if __name__ == '__main__':
-    main(mode='tune_and_train', num_classrooms=2)
-```
-
-## Understanding Omega Values
-
-The `omega` (or `gamma` in the environment) parameter controls the trade-off between:
-- **Infection control**: Reducing infected students (health objective)
-- **Classroom attendance**: Maximizing in-person learning (education objective)
-
-Lower omega values prioritize infection control, while higher values prioritize attendance.
-
-## Output Structure
-
-After running the training scripts, you'll find:
+## Output layout
 
 ```
 safecampus_multiclassroom/
 ├── centralized_ppo_results/
-│   ├── models/
-│   │   ├── centralized_omega_0.1_run_0.pt
-│   │   └── ...
-│   ├── training_rewards.png
-│   ├── policy_grids.png
-│   └── monotonicity_summary.png
+│   ├── models/centralized_omega_{ω}_hd_{hd}_run_0.pt
+│   └── training_rewards.png
 ├── mappo_results/
-│   ├── models/
-│   │   ├── mappo_omega_0.1_run_0.pt
-│   │   └── ...
+│   ├── models/mappo_omega_{ω}_hd_{hd}_run_0.pt
 │   ├── combined_mappo_rewards_ci.png
 │   └── combined_mappo_optimal_policies.png
 └── analysis_results/
-    ├── performance_comparison.png
-    ├── analysis_results.csv
-    └── analysis_results.json
+    ├── rewards_by_league_{synthetic,real}.png
+    ├── normalized_score_{synthetic,real}.png
+    ├── decomposition_{synthetic,real}.png
+    ├── reward_terms_{synthetic,real}.png
+    ├── trajectories_{synthetic,real}.png
+    ├── diagnostic_results.csv
+    └── diagnostic_results.json
 ```
 
 ## Notes
 
-- The environment uses continuous action spaces (capacity fractions from 0 to 1)
-- Policies are evaluated for monotonicity: actions should decrease as infections/risk increase
-- All training uses cooperative rewards where agents share a common objective
-- Evaluation mode uses fixed community risk trajectories from `weekly_risk_sample_b.csv`
-
-
-
+- Actions are continuous capacity fractions in `[0, 1]`, scaled to `[0, TOTAL_STUDENTS]`.
+- All training uses cooperative rewards (agents share a common objective).
+- **Reward is the only performance metric** — hyperparameters are selected on reward alone.
+- Centralized policy *structure* is intentionally not plotted: its action depends on the full
+  `2·K`-dimensional state, so any static heatmap would require fixing the other rooms at arbitrary
+  values. Behavior is instead read from on-distribution rollouts in the analysis (`trajectories_*`).
