@@ -16,6 +16,8 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.distributions import Beta
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import os
 import json
@@ -70,6 +72,7 @@ CRITIC_NUM_LAYERS = 2
 NUM_RUNS = 1
 
 device = torch.device("cpu")
+print(f"Training on device: {device}")
 
 # Matplotlib formatting
 plt.rcParams.update({
@@ -539,7 +542,7 @@ class MAPPO_CTDE:
 
     def select_action(self, agent_idx, state):
         """Select action for a specific agent using its old policy."""
-        state_tensor = torch.FloatTensor(state).unsqueeze(0).to(device)
+        state_tensor = torch.tensor(state, dtype=torch.float32, device=device).unsqueeze(0)
         action, logprob = self.actors_old[agent_idx].act(state_tensor)
         return action.cpu().numpy().flatten(), logprob
 
@@ -788,7 +791,7 @@ def run_marl_session(omega, seed, lr, episodes, num_classrooms=NUM_CLASSROOMS,
             
             # Construct global state
             g_state = np.concatenate([n_obs[aid] for aid in agent_ids])
-            g_state_tensor = torch.FloatTensor(g_state)
+            g_state_tensor = torch.tensor(g_state, dtype=torch.float32)
             
             actions_for_env = {}
 
@@ -799,11 +802,11 @@ def run_marl_session(omega, seed, lr, episodes, num_classrooms=NUM_CLASSROOMS,
             # Each agent selects action
             for aid in agent_ids:
                 agent_idx = agent_idx_map[aid]
-                s_t = torch.FloatTensor(n_obs[aid]).to(device)
+                s_t = torch.tensor(n_obs[aid], dtype=torch.float32, device=device)
 
                 # Sample action from policy
                 a_normalized, lp = mappo.select_action(agent_idx, n_obs[aid])
-                a_normalized_tensor = torch.FloatTensor(a_normalized).to(device)
+                a_normalized_tensor = torch.tensor(a_normalized, dtype=torch.float32, device=device)
 
                 # Scale to environment action space
                 a_env = a_normalized * TOTAL_STUDENTS

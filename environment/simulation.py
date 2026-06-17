@@ -21,38 +21,39 @@ def simulate_infections_n_classrooms(n_classes, alpha_m, beta, current_infected,
     The cross-classroom coupling strength is the shared-student fraction f itself
     (the former separate transmission rate phi/delta has been removed).
     """
-    new_infected = []
-    for i in range(n_classes):
-        current_inf = current_infected[i]
-        allowed = allowed_students[i]
-        comm_risk = community_risk[i]
+    current_inf = np.array(current_infected)
+    allowed = np.array(allowed_students)
+    comm_risk = np.array(community_risk)
+    alpha_arr = np.array(alpha_m)
+    beta_arr = np.array(beta)
 
-        # Within-classroom infections
-        in_class_term = alpha_m[i] * current_inf * allowed
+    # Within-classroom infections
+    in_class_term = alpha_arr * current_inf * allowed
 
-        # Community risk infections
-        community_term = beta[i] * comm_risk * (allowed ** 2)
+    # Community risk infections
+    community_term = beta_arr * comm_risk * (allowed ** 2)
 
-        # Compute average infection proportion from the other classrooms
-        other_props = []
-        for j in range(n_classes):
-            if i != j:
-                if allowed_students[j] > 0:
-                    other_props.append(current_infected[j] / allowed_students[j])
-                else:
-                    other_props.append(0)
-        avg_prop = np.mean(other_props) if other_props else 0
+    # Compute average infection proportion from the other classrooms
+    prop = np.zeros(n_classes)
+    mask = allowed > 0
+    prop[mask] = current_inf[mask] / allowed[mask]
+    
+    total_prop = np.sum(prop)
+    if n_classes > 1:
+        avg_prop = (total_prop - prop) / (n_classes - 1)
+    else:
+        avg_prop = np.zeros(n_classes)
 
-        # Compute number of shared students based on the fraction
-        shared_students = int(allowed * shared_student_fraction)
+    # Compute number of shared students based on the fraction
+    shared_students = (allowed * shared_student_fraction).astype(int)
 
-        # Cross-classroom infections using the population game formulation
-        cross_class_term = shared_students * avg_prop
+    # Cross-classroom infections using the population game formulation
+    cross_class_term = shared_students * avg_prop
 
-        total_infected = in_class_term + community_term + cross_class_term
+    total_infected = in_class_term + community_term + cross_class_term
 
-        # Ensure the new infections do not exceed the number of allowed students
-        total_infected = np.minimum(total_infected, allowed)
-        new_infected.append(int(total_infected))
-    return new_infected
+    # Ensure the new infections do not exceed the number of allowed students
+    total_infected = np.minimum(total_infected, allowed)
+    
+    return total_infected.astype(int).tolist()
 

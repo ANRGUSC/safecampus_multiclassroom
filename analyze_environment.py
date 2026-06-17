@@ -34,6 +34,8 @@ Author: SafeCampus Project
 """
 
 import numpy as np
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import os
 import json
@@ -153,7 +155,9 @@ class JointMyopicPolicy:
     name = 'joint_myopic'
 
     def __init__(self, n_action_bins=N_ACTION_BINS):
+        from itertools import product
         self.grid = np.linspace(0, TOTAL_STUDENTS, n_action_bins)
+        self.combos = list(product(self.grid, repeat=NUM_CLASSROOMS))
         self._scratch = make_env(0.5)  # reused; gamma set per-call below
 
     def available(self):
@@ -168,9 +172,8 @@ class JointMyopicPolicy:
         return s
 
     def act(self, env, obs, agent_ids, omega):
-        from itertools import product
         best_r, best_a = -np.inf, None
-        for combo in product(self.grid, repeat=len(agent_ids)):
+        for combo in self.combos:
             s = self._scratch_at(env, omega)
             acts = {aid: np.array([combo[i]]) for i, aid in enumerate(agent_ids)}
             _, rewards, _, _ = s.step(acts)
@@ -234,7 +237,8 @@ class CentralizedPolicy:
         for aid in agent_ids:
             gstate.append(obs[aid][0] / env.total_students)
             gstate.append(obs[aid][1])
-        st = torch.FloatTensor(np.array(gstate, dtype=np.float32)).unsqueeze(0)
+        device = next(self.model.actor.parameters()).device
+        st = torch.tensor(np.array(gstate, dtype=np.float32), device=device).unsqueeze(0)
         with torch.no_grad():
             ja = self.model.actor.get_deterministic_action(st).cpu().numpy().flatten()
         return {aid: np.array([ja[i] * env.total_students]) for i, aid in enumerate(agent_ids)}
@@ -255,7 +259,8 @@ class CTDEPolicy:
         actions = {}
         for i, aid in enumerate(agent_ids):
             s = self.normalize(obs[aid], env.total_students)
-            st = torch.FloatTensor(s).unsqueeze(0)
+            device = next(self.model.actors[i].parameters()).device
+            st = torch.tensor(s, dtype=torch.float32, device=device).unsqueeze(0)
             with torch.no_grad():
                 a = self.model.actors[i].get_deterministic_action(st)
             actions[aid] = a.cpu().numpy().flatten() * env.total_students
@@ -322,11 +327,13 @@ class DPUpperBound:
 
     def __init__(self, omega, risk_vector, num_classrooms=NUM_CLASSROOMS,
                  total_students=TOTAL_STUDENTS, max_weeks=MAX_WEEKS, n_action_bins=N_ACTION_BINS):
+        from itertools import product
         self.omega = omega
         self.risk_vector = list(risk_vector)
         self.num_classrooms = num_classrooms
         self.max_weeks = max_weeks
         self.action_vals = np.linspace(0, total_students, n_action_bins)
+        self.combos = list(product(self.action_vals, repeat=self.num_classrooms))
         self.value_cache = {}
         self.policy_cache = {}
         self._sim = MultiClassroomEnv(
@@ -351,9 +358,8 @@ class DPUpperBound:
         key = (*state, t)
         if key in self.value_cache:
             return self.value_cache[key]
-        from itertools import product
         best_v, best_a = -np.inf, None
-        for combo in product(self.action_vals, repeat=self.num_classrooms):
+        for combo in self.combos:
             nxt, r = self._simulate_step(list(state), combo, t)
             q = r + self.get_value(tuple(nxt), t + 1)
             if q > best_v:
@@ -759,7 +765,7 @@ def print_summary(results, decomp, omegas=OMEGA_VALUES):
             for m in ALL_METHODS:
                 r = results[fam][o].get(m)
                 parts.append(f"{m}={r['mean']:.1f}" if r else f"{m}=NA")
-            print(f"ω={o}: " + ", ".join(parts))
+            print(f"omega={o}: " + ", ".join(parts))
             d = decomp[fam][o].get('price_of_decentralization')
             if d:
                 sig = "*" if d['p_value'] < 0.05 else ""

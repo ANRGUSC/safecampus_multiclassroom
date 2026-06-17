@@ -17,6 +17,8 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import os
 import json
@@ -64,6 +66,7 @@ NUM_LAYERS = 2
 NUM_RUNS = 1
 
 device = torch.device("cpu")
+print(f"Training on device: {device}")
 
 plt.rcParams.update({
     'font.size': 12,
@@ -303,7 +306,7 @@ class CentralizedPPO:
             log_prob: Log probability
             value: Value estimate for the state
         """
-        state_tensor = torch.FloatTensor(global_state).unsqueeze(0).to(device)
+        state_tensor = torch.tensor(global_state, dtype=torch.float32, device=device).unsqueeze(0)
 
         with torch.no_grad():
             actions, log_prob = self.actor_old.act(state_tensor)
@@ -496,8 +499,8 @@ def run_centralized_training(omega, seed, lr, episodes, num_classrooms=NUM_CLASS
             joint_reward = sum(rewards.values()) / len(rewards)
 
             # Store in buffer
-            buffer.states.append(torch.FloatTensor(global_state))
-            buffer.actions.append(torch.FloatTensor(actions_normalized))
+            buffer.states.append(torch.tensor(global_state, dtype=torch.float32))
+            buffer.actions.append(torch.tensor(actions_normalized, dtype=torch.float32))
             buffer.logprobs.append(log_prob)
             buffer.values.append(value.squeeze())
             buffer.rewards.append(joint_reward)
@@ -567,7 +570,7 @@ def grid_search_tuning(num_classrooms=NUM_CLASSROOMS):
                 avg_eval_reward = 0
 
                 while not done:
-                    state_tensor = torch.FloatTensor(global_state).unsqueeze(0).to(device)
+                    state_tensor = torch.tensor(global_state, dtype=torch.float32, device=device).unsqueeze(0)
                     with torch.no_grad():
                         actions_normalized = ppo.actor.get_deterministic_action(state_tensor).cpu().numpy().flatten()
                     actions_env = {aid: np.array([actions_normalized[i] * TOTAL_STUDENTS]) for i, aid in enumerate(agent_ids)}
