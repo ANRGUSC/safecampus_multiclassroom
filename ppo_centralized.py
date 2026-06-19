@@ -13,18 +13,26 @@ This version uses Beta policy (proper PPO):
 Author: SafeCampus Project
 """
 
+# pyrefly: ignore [missing-import]
 import numpy as np
+# pyrefly: ignore [missing-import]
 import torch
+# pyrefly: ignore [missing-import]
 import torch.nn as nn
+# pyrefly: ignore [missing-import]
 import torch.optim as optim
+# pyrefly: ignore [missing-import]
 import matplotlib
 matplotlib.use('Agg')
+# pyrefly: ignore [missing-import]
 import matplotlib.pyplot as plt
 import os
 import json
 import random
 import time
+import argparse
 
+# pyrefly: ignore [missing-import]
 from environment.multiclassroom import MultiClassroomEnv
 
 # ============================================================
@@ -57,6 +65,7 @@ TOTAL_STUDENTS = 50
 NUM_CLASSROOMS = 2
 COOPERATIVE_REWARD = True
 TUNE_SEED = 123
+SHARED_FRACTION = 0.3
 
 # Network Architecture
 HIDDEN_DIM = 32
@@ -449,7 +458,7 @@ class CentralizedPPO:
 # 4. TRAINING FUNCTIONS
 # ============================================================
 
-def run_centralized_training(omega, seed, lr, episodes, num_classrooms=NUM_CLASSROOMS, hidden_dim=HIDDEN_DIM):
+def run_centralized_training(omega, seed, lr, episodes, num_classrooms=NUM_CLASSROOMS, hidden_dim=HIDDEN_DIM, shared_fraction=SHARED_FRACTION):
     """Run centralized PPO training."""
     set_seed(seed)
 
@@ -459,7 +468,8 @@ def run_centralized_training(omega, seed, lr, episodes, num_classrooms=NUM_CLASS
         max_weeks=MAX_WEEKS,
         gamma=omega,
         continuous_action=True,
-        cooperative_reward=COOPERATIVE_REWARD
+        cooperative_reward=COOPERATIVE_REWARD,
+        shared_fraction=shared_fraction
     )
 
     agent_ids = sorted(env.agents)
@@ -531,7 +541,7 @@ def select_best_hyperparams(omega_results):
     return (best['lr'], best['hidden_dim']), best, {}
 
 
-def grid_search_tuning(num_classrooms=NUM_CLASSROOMS):
+def grid_search_tuning(num_classrooms=NUM_CLASSROOMS, shared_fraction=SHARED_FRACTION):
     """Grid search for best learning rate and hidden dimension per omega."""
     optimized_hyperparams = {}
 
@@ -551,7 +561,7 @@ def grid_search_tuning(num_classrooms=NUM_CLASSROOMS):
             for hidden_dim in HIDDEN_DIM_CANDIDATES:
                 print(f"\n  Testing LR={lr}, Hidden Dim={hidden_dim}...")
 
-                ppo, history = run_centralized_training(omega, TUNE_SEED, lr, TUNE_EPISODES, num_classrooms, hidden_dim)
+                ppo, history = run_centralized_training(omega, TUNE_SEED, lr, TUNE_EPISODES, num_classrooms, hidden_dim, shared_fraction)
 
                 # Evaluation
                 env = MultiClassroomEnv(
@@ -561,7 +571,8 @@ def grid_search_tuning(num_classrooms=NUM_CLASSROOMS):
                     gamma=omega,
                     continuous_action=True,
                     cooperative_reward=COOPERATIVE_REWARD,
-                    eval_mode=True
+                    eval_mode=True,
+                    shared_fraction=shared_fraction
                 )
                 agent_ids = sorted(env.agents)
                 obs = env.reset()
@@ -611,7 +622,7 @@ def load_hyperparams():
 # 6. FULL TRAINING AND EVALUATION
 # ============================================================
 
-def train_and_evaluate_optimal(optimized_hyperparams, num_classrooms=NUM_CLASSROOMS):
+def train_and_evaluate_optimal(optimized_hyperparams, shared_fraction=SHARED_FRACTION, num_classrooms=NUM_CLASSROOMS):
     """Run full training with optimized hyperparameters and save models."""
     print(f"\n--- Starting Full Training (Beta Policy) ---")
     print(f"Number of Classrooms: {num_classrooms}")
@@ -631,10 +642,10 @@ def train_and_evaluate_optimal(optimized_hyperparams, num_classrooms=NUM_CLASSRO
             seed = TUNE_SEED
             print(f"\n  Run {run + 1}/{NUM_RUNS} (seed={seed})")
 
-            ppo, history = run_centralized_training(omega, seed, lr, FULL_EPISODES, num_classrooms, hidden_dim)
+            ppo, history = run_centralized_training(omega, seed, lr, FULL_EPISODES, num_classrooms, hidden_dim, shared_fraction)
 
             # Save model
-            model_path = os.path.join(MODEL_DIR, f"centralized_omega_{omega}_hd_{hidden_dim}_run_{run}")
+            model_path = os.path.join(MODEL_DIR, f"centralized_omega_{omega}_sf_{shared_fraction}_k_{num_classrooms}_hd_{hidden_dim}_run_{run}")
             ppo.save(model_path)
 
             if run == 0:
@@ -686,7 +697,7 @@ def plot_combined_rewards(all_rewards):
 # 8. MAIN
 # ============================================================
 
-def main(mode='tune_and_train', num_classrooms=NUM_CLASSROOMS):
+def main(mode='tune_and_train', num_classrooms = NUM_CLASSROOMS, shared_fraction=SHARED_FRACTION):
     """
     Main function.
 
@@ -701,15 +712,32 @@ def main(mode='tune_and_train', num_classrooms=NUM_CLASSROOMS):
     print(f"{'='*60}")
 
     if mode in ['tune', 'tune_and_train']:
-        optimized_hyperparams = grid_search_tuning(num_classrooms)
+        optimized_hyperparams = grid_search_tuning(num_classrooms, shared_fraction)
     else:
         optimized_hyperparams = load_hyperparams()
 
     if mode in ['train', 'tune_and_train']:
-        train_and_evaluate_optimal(optimized_hyperparams, num_classrooms)
+        train_and_evaluate_optimal(optimized_hyperparams, num_classrooms, shared_fraction)
 
     print(f"\nResults saved to {OUTPUT_DIR}")
 
 
 if __name__ == '__main__':
-    main(mode='tune_and_train', num_classrooms=NUM_CLASSROOMS)
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--num_classrooms",
+        type = int,
+        default = NUM_CLASSROOMS,
+        help =  "Number of classrooms used in experiment (default:2)"
+    )
+    
+    parser.add_argument(
+        "--shared_fraction",
+        type = float,
+        default = SHARED_FRACTION,
+        help = ""
+    )
+
+    args = parser.parse_args()
+
+    main(mode='tune_and_train', num_classrooms = args.num_classrooms, shared_fraction=args.shared_fraction)

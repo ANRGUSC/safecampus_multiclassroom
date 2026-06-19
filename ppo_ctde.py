@@ -11,21 +11,30 @@ Policy options:
 Author: SafeCampus Project
 """
 
+# pyrefly: ignore [missing-import]
 import numpy as np
+# pyrefly: ignore [missing-import]
 import torch
+# pyrefly: ignore [missing-import]
 import torch.nn as nn
+# pyrefly: ignore [missing-import]
 import torch.optim as optim
+# pyrefly: ignore [missing-import]
 from torch.distributions import Beta
+# pyrefly: ignore [missing-import]
 import matplotlib
 matplotlib.use('Agg')
+# pyrefly: ignore [missing-import]
 import matplotlib.pyplot as plt
 import os
 import json
 import random
 import time
+# pyrefly: ignore [missing-import]
 from matplotlib.colors import LinearSegmentedColormap
 import colorsys
 
+# pyrefly: ignore [missing-import]
 from environment.multiclassroom import MultiClassroomEnv
 
 # ============================================================
@@ -58,6 +67,8 @@ TOTAL_STUDENTS = 50
 NUM_CLASSROOMS = 2
 COOPERATIVE_REWARD = True
 TUNE_SEED = 123
+# TODO (Student): You will need to add a default SHARED_FRACTION = 0.3 here
+# so you have a default value to use if the command line argument isn't provided.
 
 # Policy Grid Config (for policy heatmap plots)
 POLICY_GRID_POINTS = 20
@@ -746,6 +757,8 @@ def run_marl_session(omega, seed, lr, episodes, num_classrooms=NUM_CLASSROOMS,
     """Runs a single MAPPO CTDE training session."""
     set_seed(seed)
 
+    # TODO (Student): You will need to add a `shared_fraction` parameter to this function
+    # (e.g., def run_mappo_training(..., shared_fraction=SHARED_FRACTION)).
     env = MultiClassroomEnv(
         num_classrooms=num_classrooms,
         total_students=TOTAL_STUDENTS,
@@ -1030,7 +1043,10 @@ def train_and_evaluate_optimal(optimized_hyperparams, policy_type='gaussian'):
                                               critic_hidden_dim=hidden_dim)
             omega_rewards_runs.append(history)
 
-            # Save each run's model
+            # Save model
+            # TODO (Student): Update this path to include `num_classrooms` and `shared_fraction`.
+            # Example: f"mappo_omega_{omega}_sf_{shared_fraction}_k_{num_classrooms}_hd_{hidden_dim}_run_{run}"
+            # This prevents overwriting when you loop over different values!
             model_path = os.path.join(MODEL_DIR, f"mappo_omega_{omega}_hd_{hidden_dim}_run_{run}")
             mappo.save(model_path)
 
@@ -1185,7 +1201,11 @@ def main(mode='train', policy_type='gaussian'):
 
 
 if __name__ == '__main__':
-    # Use Gaussian policy (standard MAPPO) by default
+    # TODO (Student): Import `argparse` at the top of the file.
+    # Set up argparse here to accept:
+    # --num_classrooms (int, default=NUM_CLASSROOMS)
+    # --shared_fraction (float, default=SHARED_FRACTION)
+    # Then pass those parsed arguments into main()!
     main(mode='tune_and_train', policy_type='beta')
 
     # To use other policies:

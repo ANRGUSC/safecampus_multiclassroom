@@ -33,15 +33,19 @@ The environment is the SAME for every method (TOTAL_STUDENTS, dynamics, reward).
 Author: SafeCampus Project
 """
 
+# pyrefly: ignore [missing-import]
 import numpy as np
+# pyrefly: ignore [missing-import]
 import matplotlib
 matplotlib.use('Agg')
+# pyrefly: ignore [missing-import]
 import matplotlib.pyplot as plt
 import os
 import json
 import time
 import pandas as pd
 
+# pyrefly: ignore [missing-import]
 from environment.multiclassroom import MultiClassroomEnv
 
 # ============================================================
@@ -66,7 +70,14 @@ K_SCENARIOS = 50
 DP_SCENARIOS = 10
 EVAL_SEED_BASE = 9000  # held-out block, disjoint from training seeds (123, 101, 42)
 
+# Default Sweep parameters
 OMEGA_VALUES = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6]
+
+# TODO (Student): You will need to add a default SHARED_FRACTION = 0.3 here
+# and a default NUM_CLASSROOMS = 2 here.
+
+# Shared configs (MUST MATCH TRAINING)
+TOTAL_STUDENTS = 50
 
 # Bootstrap
 N_BOOT = 2000
@@ -120,6 +131,7 @@ def build_scenarios(k=K_SCENARIOS):
 
 
 def make_env(omega):
+    # TODO (Student): You will need to pass `shared_fraction` to MultiClassroomEnv here
     return MultiClassroomEnv(
         num_classrooms=NUM_CLASSROOMS,
         total_students=TOTAL_STUDENTS,
@@ -195,6 +207,7 @@ class DecentralizedMyopicPolicy:
 
     def __init__(self, n_action_bins=N_ACTION_BINS):
         self.grid = np.linspace(0, TOTAL_STUDENTS, n_action_bins)
+        # TODO (Student): You will need to pass `shared_fraction` to MultiClassroomEnv here
         self._sim = MultiClassroomEnv(
             num_classrooms=1, total_students=TOTAL_STUDENTS, max_weeks=MAX_WEEKS,
             gamma=0.5, continuous_action=True, cooperative_reward=True, eval_mode=False)
@@ -232,6 +245,7 @@ class CentralizedPolicy:
         return self.model is not None
 
     def act(self, env, obs, agent_ids, omega):
+        # pyrefly: ignore [missing-import]
         import torch
         gstate = []
         for aid in agent_ids:
@@ -255,6 +269,7 @@ class CTDEPolicy:
         return self.model is not None
 
     def act(self, env, obs, agent_ids, omega):
+        # pyrefly: ignore [missing-import]
         import torch
         actions = {}
         for i, aid in enumerate(agent_ids):
@@ -269,6 +284,8 @@ class CTDEPolicy:
 
 # ---- trained-model loaders (graceful: return None if not found) ----
 
+# TODO (Student): Add `shared_fraction` and `num_classrooms` as arguments to these loaders
+# so they can reconstruct the correct file path (e.g., f"centralized_omega_{omega}_sf_{shared_fraction}_k_{num_classrooms}...")
 def _resolve_model_path(results_dir, prefix, omega):
     hp_file = os.path.join(results_dir, "optimized_hyperparams.json")
     hidden_dim = 64
@@ -286,6 +303,7 @@ def _resolve_model_path(results_dir, prefix, omega):
 
 def _load_centralized(omega):
     try:
+        # pyrefly: ignore [missing-import]
         from ppo_centralized import CentralizedPPO
         path = _resolve_model_path("centralized_ppo_results", "centralized", omega)
         if path is None:
@@ -799,7 +817,12 @@ def run_full_analysis(k=K_SCENARIOS, dp_k=DP_SCENARIOS, omegas=OMEGA_VALUES):
     return results, decomp
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
+    # TODO (Student): Import `argparse` at the top of the file.
+    # Set up argparse here to accept:
+    # --num_classrooms (int, default=2)
+    # --shared_fraction (float, default=0.3)
+    # Pass them into `run_evaluation()`
     run_full_analysis()
     print("\n" + "=" * 80)
     print(f"ANALYSIS COMPLETE — results in {OUTPUT_DIR}/")
