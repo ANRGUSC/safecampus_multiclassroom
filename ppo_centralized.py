@@ -735,7 +735,7 @@ if __name__ == '__main__':
         "--shared_fraction",
         type = float,
         default = SHARED_FRACTION,
-        help = ""
+        help = "Controls how connected the classrooms are lower is isolated, higher has a risk of spillover (default:0.3)"
     )
 
     args = parser.parse_args()

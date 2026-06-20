@@ -34,6 +34,7 @@ Author: SafeCampus Project
 """
 
 # pyrefly: ignore [missing-import]
+# pyrefly: ignore [missing-import]
 import numpy as np
 # pyrefly: ignore [missing-import]
 import matplotlib
@@ -44,6 +45,7 @@ import os
 import json
 import time
 import pandas as pd
+import argparse
 
 # pyrefly: ignore [missing-import]
 from environment.multiclassroom import MultiClassroomEnv
@@ -73,8 +75,9 @@ EVAL_SEED_BASE = 9000  # held-out block, disjoint from training seeds (123, 101,
 # Default Sweep parameters
 OMEGA_VALUES = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6]
 
-# TODO (Student): You will need to add a default SHARED_FRACTION = 0.3 here
-# and a default NUM_CLASSROOMS = 2 here.
+# You got this correct!
+SHARED_FRACTION = 0.3
+NUM_CLASSROOMS = 2
 
 # Shared configs (MUST MATCH TRAINING)
 TOTAL_STUDENTS = 50
@@ -131,7 +134,6 @@ def build_scenarios(k=K_SCENARIOS):
 
 
 def make_env(omega):
-    # TODO (Student): You will need to pass `shared_fraction` to MultiClassroomEnv here
     return MultiClassroomEnv(
         num_classrooms=NUM_CLASSROOMS,
         total_students=TOTAL_STUDENTS,
@@ -140,6 +142,8 @@ def make_env(omega):
         continuous_action=True,
         cooperative_reward=COOPERATIVE_REWARD,
         eval_mode=False,
+        # (Otherwise python will crash because `shared_fraction` lowercase doesn't exist inside this function)
+        shared_fraction=SHARED_FRACTION
     )
 
 
@@ -207,10 +211,9 @@ class DecentralizedMyopicPolicy:
 
     def __init__(self, n_action_bins=N_ACTION_BINS):
         self.grid = np.linspace(0, TOTAL_STUDENTS, n_action_bins)
-        # TODO (Student): You will need to pass `shared_fraction` to MultiClassroomEnv here
         self._sim = MultiClassroomEnv(
             num_classrooms=1, total_students=TOTAL_STUDENTS, max_weeks=MAX_WEEKS,
-            gamma=0.5, continuous_action=True, cooperative_reward=True, eval_mode=False)
+            gamma=0.5, continuous_action=True, cooperative_reward=True, eval_mode=False, shared_fraction=SHARED_FRACTION)
 
     def available(self):
         return True
@@ -284,9 +287,8 @@ class CTDEPolicy:
 
 # ---- trained-model loaders (graceful: return None if not found) ----
 
-# TODO (Student): Add `shared_fraction` and `num_classrooms` as arguments to these loaders
-# so they can reconstruct the correct file path (e.g., f"centralized_omega_{omega}_sf_{shared_fraction}_k_{num_classrooms}...")
-def _resolve_model_path(results_dir, prefix, omega):
+# Awesome, you perfectly updated the path resolution!
+def _resolve_model_path(results_dir, prefix, omega, shared_fraction=SHARED_FRACTION, num_classrooms=NUM_CLASSROOMS):
     hp_file = os.path.join(results_dir, "optimized_hyperparams.json")
     hidden_dim = 64
     if os.path.exists(hp_file):
@@ -294,7 +296,7 @@ def _resolve_model_path(results_dir, prefix, omega):
             hp = json.load(f)
         if str(float(omega)) in hp:
             hidden_dim = hp[str(float(omega))].get('hidden_dim', 64)
-    p = os.path.join(results_dir, "models", f"{prefix}_omega_{omega}_hd_{hidden_dim}_run_0")
+    p = os.path.join(results_dir, "models", f"{prefix}_omega_{omega}_sf_{shared_fraction}_k_{num_classrooms}_hd_{hidden_dim}_run_0")
     if os.path.exists(p + '.pt'):
         return p
     p_old = os.path.join(results_dir, "models", f"{prefix}_omega_{omega}_run_0")
@@ -305,7 +307,7 @@ def _load_centralized(omega):
     try:
         # pyrefly: ignore [missing-import]
         from ppo_centralized import CentralizedPPO
-        path = _resolve_model_path("centralized_ppo_results", "centralized", omega)
+        path = _resolve_model_path("centralized_ppo_results", "centralized", omega, shared_fraction=SHARED_FRACTION, num_classrooms=NUM_CLASSROOMS)
         if path is None:
             return None
         return CentralizedPPO.load(path)
@@ -326,7 +328,7 @@ def _load_ctde(omega):
                 continue
         if mod is None:
             return None, None
-        path = _resolve_model_path("mappo_results", "mappo", omega)
+        path = _resolve_model_path("mappo_results", "mappo", omega, shared_fraction=SHARED_FRACTION, num_classrooms=NUM_CLASSROOMS)
         if path is None:
             return None, None
         return mod.MAPPO_CTDE.load(path), mod.normalize_state
@@ -818,11 +820,30 @@ def run_full_analysis(k=K_SCENARIOS, dp_k=DP_SCENARIOS, omegas=OMEGA_VALUES):
 
 
 if __name__ == '__main__':
-    # TODO (Student): Import `argparse` at the top of the file.
-    # Set up argparse here to accept:
-    # --num_classrooms (int, default=2)
-    # --shared_fraction (float, default=0.3)
-    # Pass them into `run_evaluation()`
+    # 3. Use `args` to overwrite the GLOBAL variables before calling run_full_analysis(). 
+
+
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument(
+        "--num_classrooms",
+        type = int,
+        default = 2,
+        help = "Number of classrooms used in experiment (default:2)"
+    )
+
+    parser.add_argument(
+        "--shared_fraction",
+        type = float,
+        default = 0.3,
+        help = "Controls how connected the classrooms are lower is isolated, higher has a risk of spillover (default:0.3)"
+    )
+
+    args = parser.parse_args()
+
+    SHARED_FRACTION = args.shared_fraction
+    NUM_CLASSROOMS = args.num_classrooms
+    
     run_full_analysis()
     print("\n" + "=" * 80)
     print(f"ANALYSIS COMPLETE — results in {OUTPUT_DIR}/")

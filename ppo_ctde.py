@@ -33,6 +33,7 @@ import time
 # pyrefly: ignore [missing-import]
 from matplotlib.colors import LinearSegmentedColormap
 import colorsys
+import argparse
 
 # pyrefly: ignore [missing-import]
 from environment.multiclassroom import MultiClassroomEnv
@@ -67,9 +68,7 @@ TOTAL_STUDENTS = 50
 NUM_CLASSROOMS = 2
 COOPERATIVE_REWARD = True
 TUNE_SEED = 123
-# TODO (Student): You will need to add a default SHARED_FRACTION = 0.3 here
-# so you have a default value to use if the command line argument isn't provided.
-
+SHARED_FRACTION = 0.3
 # Policy Grid Config (for policy heatmap plots)
 POLICY_GRID_POINTS = 20
 
@@ -753,19 +752,19 @@ class MAPPO_CTDE:
 
 def run_marl_session(omega, seed, lr, episodes, num_classrooms=NUM_CLASSROOMS,
                      policy_type='gaussian', actor_hidden_dim=ACTOR_HIDDEN_DIM,
-                     critic_hidden_dim=CRITIC_HIDDEN_DIM):
+                     critic_hidden_dim=CRITIC_HIDDEN_DIM, shared_fraction=SHARED_FRACTION):
     """Runs a single MAPPO CTDE training session."""
     set_seed(seed)
 
-    # TODO (Student): You will need to add a `shared_fraction` parameter to this function
-    # (e.g., def run_mappo_training(..., shared_fraction=SHARED_FRACTION)).
+    # Excellent! You correctly updated the signature and passed it to the env.
     env = MultiClassroomEnv(
         num_classrooms=num_classrooms,
         total_students=TOTAL_STUDENTS,
         max_weeks=MAX_WEEKS,
         gamma=omega,
         continuous_action=True,
-        cooperative_reward=COOPERATIVE_REWARD
+        cooperative_reward=COOPERATIVE_REWARD,
+        shared_fraction =shared_fraction
     )
 
     num_agents = len(env.agents)
@@ -885,20 +884,21 @@ def extract_policy_grid(mappo_agent, agent_idx=0, total_students=TOTAL_STUDENTS,
 TUNE_EVAL_SEEDS = [101]
 
 
-def evaluate_tuning_agents(omega_val, mappo_agent, eval_seeds):
+def evaluate_tuning_agents(omega_val, mappo_agent, eval_seeds, num_classrooms=NUM_CLASSROOMS, shared_fraction=SHARED_FRACTION):
     """Evaluates trained MAPPO_CTDE agent across multiple seeds."""
     total_rewards = []
 
     for seed in eval_seeds:
         set_seed(seed)
         eval_env = MultiClassroomEnv(
-            num_classrooms=NUM_CLASSROOMS,
             total_students=TOTAL_STUDENTS,
             max_weeks=MAX_WEEKS,
             gamma=omega_val,
             continuous_action=True,
             cooperative_reward=COOPERATIVE_REWARD,
             eval_mode=False,
+            num_classrooms=num_classrooms,
+            shared_fraction=shared_fraction
         )
 
         agent_ids = sorted(eval_env.agents)
@@ -947,7 +947,7 @@ def select_best_hyperparams(omega_results):
     return (best_lr, best_hidden_dim), best_metrics, {}
 
 
-def grid_search_tuning(policy_type='gaussian'):
+def grid_search_tuning(policy_type='gaussian', num_classrooms=NUM_CLASSROOMS, shared_fraction=SHARED_FRACTION):
     """Performs grid search tuning for each omega value."""
     optimized_hyperparams = {}
 
@@ -970,9 +970,11 @@ def grid_search_tuning(policy_type='gaussian'):
                 mappo, history = run_marl_session(omega, TUNE_SEED, lr, TUNE_EPISODES,
                                                   policy_type=policy_type,
                                                   actor_hidden_dim=hidden_dim,
-                                                  critic_hidden_dim=hidden_dim)
+                                                  critic_hidden_dim=hidden_dim,
+                                                  num_classrooms=num_classrooms,
+                                                  shared_fraction=shared_fraction)
 
-                avg_reward = evaluate_tuning_agents(omega, mappo, TUNE_EVAL_SEEDS)
+                avg_reward = evaluate_tuning_agents(omega, mappo, TUNE_EVAL_SEEDS, num_classrooms=num_classrooms, shared_fraction=shared_fraction)
 
                 result = {
                     'lr': lr,
@@ -1016,7 +1018,7 @@ def load_hyperparams():
 # 6. FULL TRAINING AND EVALUATION
 # ============================================================
 
-def train_and_evaluate_optimal(optimized_hyperparams, policy_type='gaussian'):
+def train_and_evaluate_optimal(optimized_hyperparams, policy_type='gaussian', num_classrooms=NUM_CLASSROOMS, shared_fraction=SHARED_FRACTION):
     """Runs full training with optimized hyperparameters and saves models."""
     print(f"\n--- Starting Full Training with Optimal Hyperparameters ({policy_type} MAPPO) ---")
 
@@ -1040,14 +1042,13 @@ def train_and_evaluate_optimal(optimized_hyperparams, policy_type='gaussian'):
             mappo, history = run_marl_session(omega, seed, lr, FULL_EPISODES,
                                               policy_type=policy_type,
                                               actor_hidden_dim=hidden_dim,
-                                              critic_hidden_dim=hidden_dim)
+                                              critic_hidden_dim=hidden_dim,
+                                              num_classrooms=num_classrooms,
+                                              shared_fraction=shared_fraction)
             omega_rewards_runs.append(history)
 
             # Save model
-            # TODO (Student): Update this path to include `num_classrooms` and `shared_fraction`.
-            # Example: f"mappo_omega_{omega}_sf_{shared_fraction}_k_{num_classrooms}_hd_{hidden_dim}_run_{run}"
-            # This prevents overwriting when you loop over different values!
-            model_path = os.path.join(MODEL_DIR, f"mappo_omega_{omega}_hd_{hidden_dim}_run_{run}")
+            model_path = os.path.join(MODEL_DIR, f"mappo_omega_{omega}_sf_{shared_fraction}_k_{num_classrooms}_hd_{hidden_dim}_run_{run}")
             mappo.save(model_path)
 
             if run == 0:
@@ -1171,7 +1172,7 @@ def plot_policy_strips(representative_agents):
 # 8. MAIN CONTROL FUNCTION
 # ============================================================
 
-def main(mode='train', policy_type='gaussian'):
+def main(mode='train', policy_type='gaussian', num_classrooms = NUM_CLASSROOMS, shared_fraction = SHARED_FRACTION):
     """
     Main function to control execution flow.
 
@@ -1190,23 +1191,38 @@ def main(mode='train', policy_type='gaussian'):
     optimized_hyperparams = {}
 
     if mode == 'tune' or mode == 'tune_and_train':
-        optimized_hyperparams = grid_search_tuning(policy_type=policy_type)
+        optimized_hyperparams = grid_search_tuning(policy_type=policy_type, num_classrooms=num_classrooms, shared_fraction=shared_fraction)
     else:
         optimized_hyperparams = load_hyperparams()
 
     if mode == 'train' or mode == 'tune_and_train':
-        train_and_evaluate_optimal(optimized_hyperparams, policy_type=policy_type)
+        train_and_evaluate_optimal(optimized_hyperparams, policy_type=policy_type, num_classrooms=num_classrooms, shared_fraction=shared_fraction)
 
     print(f"\nAll processing complete. Results in {OUTPUT_DIR}")
 
 
 if __name__ == '__main__':
-    # TODO (Student): Import `argparse` at the top of the file.
-    # Set up argparse here to accept:
-    # --num_classrooms (int, default=NUM_CLASSROOMS)
-    # --shared_fraction (float, default=SHARED_FRACTION)
-    # Then pass those parsed arguments into main()!
-    main(mode='tune_and_train', policy_type='beta')
+    # Awesome job on the argparse setup! You nailed the parsing and passing to main().
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument(
+        "--num_classrooms",
+        type = int,
+        default = NUM_CLASSROOMS,
+        help = "Number of classrooms used in experiment (default:2)"
+    )
+
+    parser.add_argument(
+        "--shared_fraction",
+        type = float,
+        default = SHARED_FRACTION,
+        help = "Controls how connected the classrooms are lower is isolated, higher has a risk of spillover (default:0.3)"
+    )
+
+    args = parser.parse_args()
+
+    main(mode='tune_and_train', policy_type='beta', num_classrooms = args.num_classrooms, shared_fraction=args.shared_fraction)
+
 
     # To use other policies:
     # main(mode='tune_and_train', policy_type='beta')
