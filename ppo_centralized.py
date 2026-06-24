@@ -697,7 +697,7 @@ def plot_combined_rewards(all_rewards):
 # 8. MAIN
 # ============================================================
 
-def main(mode='tune_and_train', num_classrooms = NUM_CLASSROOMS, shared_fraction=SHARED_FRACTION):
+def main(mode='tune_and_train', num_classrooms = NUM_CLASSROOMS, shared_fraction=SHARED_FRACTION, limit_omega=False):
     """
     Main function.
 
@@ -706,18 +706,24 @@ def main(mode='tune_and_train', num_classrooms = NUM_CLASSROOMS, shared_fraction
     - 'train': Train with saved hyperparameters
     - 'tune_and_train': Both
     """
+
+    if limit_omega:
+        global OMEGA_VALUES
+        OMEGA_VALUES = [0.2, 0.4]
+
+
     print(f"\n{'='*60}")
     print(f"Centralized PPO Training (Beta Policy)")
     print(f"Number of Classrooms: {num_classrooms}")
     print(f"{'='*60}")
 
     if mode in ['tune', 'tune_and_train']:
-        optimized_hyperparams = grid_search_tuning(num_classrooms, shared_fraction)
+        optimized_hyperparams = grid_search_tuning(num_classrooms=num_classrooms, shared_fraction=shared_fraction)
     else:
         optimized_hyperparams = load_hyperparams()
 
     if mode in ['train', 'tune_and_train']:
-        train_and_evaluate_optimal(optimized_hyperparams, num_classrooms, shared_fraction)
+        train_and_evaluate_optimal(optimized_hyperparams, num_classrooms=num_classrooms, shared_fraction=shared_fraction)
 
     print(f"\nResults saved to {OUTPUT_DIR}")
 
@@ -738,6 +744,12 @@ if __name__ == '__main__':
         help = "Controls how connected the classrooms are lower is isolated, higher has a risk of spillover (default:0.3)"
     )
 
+    parser.add_argument(
+        "--limit_omega",
+        action="store_true",
+        help = "If flag included restricts omega values to [0.2, 0.4] for faster training (default:False)"
+    )
+
     args = parser.parse_args()
 
-    main(mode='tune_and_train', num_classrooms = args.num_classrooms, shared_fraction=args.shared_fraction)
+    main(mode='tune_and_train', num_classrooms = args.num_classrooms, shared_fraction=args.shared_fraction, limit_omega=args.limit_omega)

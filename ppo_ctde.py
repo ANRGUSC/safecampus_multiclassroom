@@ -1172,7 +1172,7 @@ def plot_policy_strips(representative_agents):
 # 8. MAIN CONTROL FUNCTION
 # ============================================================
 
-def main(mode='train', policy_type='gaussian', num_classrooms = NUM_CLASSROOMS, shared_fraction = SHARED_FRACTION):
+def main(mode='train', policy_type='gaussian', num_classrooms = NUM_CLASSROOMS, shared_fraction = SHARED_FRACTION, limit_omega=False):
     """
     Main function to control execution flow.
 
@@ -1186,6 +1186,10 @@ def main(mode='train', policy_type='gaussian', num_classrooms = NUM_CLASSROOMS, 
     - 'beta': Beta distribution (naturally bounded to [0,1])
     - 'tanh': Tanh deterministic with exploration noise
     """
+    if limit_omega:
+        global OMEGA_VALUES
+        OMEGA_VALUES = [0.2, 0.4]
+
     print(f"Policy: {policy_type} MAPPO")
 
     optimized_hyperparams = {}
@@ -1219,9 +1223,15 @@ if __name__ == '__main__':
         help = "Controls how connected the classrooms are lower is isolated, higher has a risk of spillover (default:0.3)"
     )
 
+    parser.add_argument(
+        "--limit_omega",
+        action="store_true",
+        help="If flag included restricts omega values to [0.2, 0.4] for faster training (default:False)"
+    )
+
     args = parser.parse_args()
 
-    main(mode='tune_and_train', policy_type='beta', num_classrooms = args.num_classrooms, shared_fraction=args.shared_fraction)
+    main(mode='tune_and_train', policy_type='beta', num_classrooms = args.num_classrooms, shared_fraction=args.shared_fraction, limit_omega=args.limit_omega)
 
 
     # To use other policies:

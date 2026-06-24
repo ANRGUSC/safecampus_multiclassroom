@@ -75,7 +75,7 @@ EVAL_SEED_BASE = 9000  # held-out block, disjoint from training seeds (123, 101,
 # Default Sweep parameters
 OMEGA_VALUES = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6]
 
-# You got this correct!
+# Default values
 SHARED_FRACTION = 0.3
 NUM_CLASSROOMS = 2
 
@@ -289,17 +289,18 @@ class CTDEPolicy:
 
 # Awesome, you perfectly updated the path resolution!
 def _resolve_model_path(results_dir, prefix, omega, shared_fraction=SHARED_FRACTION, num_classrooms=NUM_CLASSROOMS):
-    hp_file = os.path.join(results_dir, "optimized_hyperparams.json")
-    hidden_dim = 64
-    if os.path.exists(hp_file):
-        with open(hp_file) as f:
-            hp = json.load(f)
-        if str(float(omega)) in hp:
-            hidden_dim = hp[str(float(omega))].get('hidden_dim', 64)
-    p = os.path.join(results_dir, "models", f"{prefix}_omega_{omega}_sf_{shared_fraction}_k_{num_classrooms}_hd_{hidden_dim}_run_0")
-    if os.path.exists(p + '.pt'):
-        return p
-    p_old = os.path.join(results_dir, "models", f"{prefix}_omega_{omega}_run_0")
+    model_dir = os.path.join(results_dir, "models")
+    if not os.path.exists(model_dir):
+        return None
+        
+    # Search for the newly named models: {prefix}_omega_{omega}_sf_{shared_fraction}_k_{num_classrooms}_hd_{anything}_run_0.pt
+    search_prefix = f"{prefix}_omega_{omega}_sf_{shared_fraction}_k_{num_classrooms}_hd_"
+    for filename in os.listdir(model_dir):
+        if filename.startswith(search_prefix) and filename.endswith("_run_0.pt"):
+            return os.path.join(model_dir, filename[:-3])  # Strip the .pt extension for the loader
+
+    # Fallback to the old Phase 1 naming scheme if the new one isn't found
+    p_old = os.path.join(model_dir, f"{prefix}_omega_{omega}_run_0")
     return p_old if os.path.exists(p_old + '.pt') else None
 
 
@@ -491,7 +492,7 @@ def evaluate(families, omegas=OMEGA_VALUES, k=K_SCENARIOS, dp_k=DP_SCENARIOS):
                     print(f"  {LEAGUE[mname][0]:<24}: model not found, skipped")
                     results[fam][omega][mname] = None
                     continue
-                _eval_method(results, fam, omega, mname, policy, seeds, risk)
+                results[fam][omega][mname] = _eval_method(omega, mname, policy, seeds, risk)
 
             # DP: per-scenario solve on a subset (expensive)
             dp_seeds = seeds[:dp_k]
@@ -519,16 +520,20 @@ def _scenario_risk(seed):
     return list(env.shared_community_risk)
 
 
-def _eval_method(results, fam, omega, mname, policy, seeds, risk):
+def _eval_method(omega, mname, policy, seeds, risk):
     by_seed, traj_adm, traj_inf = {}, [], []
     for s in seeds:
         out = run_episode(omega, s, risk, policy)
         by_seed[s] = out['reward']
         traj_adm.append(out['admitted'])
         traj_inf.append(out['infected'])
-    results[fam][omega][mname] = _summarize(by_seed, traj_adm, traj_inf)
-    print(f"  {LEAGUE[mname][0]:<24}: {results[fam][omega][mname]['mean']:.1f} "
-          f"[{results[fam][omega][mname]['ci_lo']:.1f}, {results[fam][omega][mname]['ci_hi']:.1f}]")
+    
+    summary = _summarize(by_seed, traj_adm, traj_inf)
+    
+    print(f"  {LEAGUE[mname][0]:<24}: {summary['mean']:.1f} "
+          f"[{summary['ci_lo']:.1f}, {summary['ci_hi']:.1f}]")
+          
+    return summary
 
 
 def _summarize(by_seed, traj_adm, traj_inf):
@@ -820,7 +825,6 @@ def run_full_analysis(k=K_SCENARIOS, dp_k=DP_SCENARIOS, omegas=OMEGA_VALUES):
 
 
 if __name__ == '__main__':
-    # 3. Use `args` to overwrite the GLOBAL variables before calling run_full_analysis(). 
 
 
     parser = argparse.ArgumentParser()
@@ -839,12 +843,108 @@ if __name__ == '__main__':
         help = "Controls how connected the classrooms are lower is isolated, higher has a risk of spillover (default:0.3)"
     )
 
+    parser.add_argument(
+        "--limit_omega",
+        action="store_true",
+        help = "If flag included restricts omega values to [0.2, 0.4] for faster training (default:False)"
+    )
+
     args = parser.parse_args()
 
     SHARED_FRACTION = args.shared_fraction
     NUM_CLASSROOMS = args.num_classrooms
     
-    run_full_analysis()
+    # TODO (Phase 2 - RQ3): Write a script or loop to execute the trainers
+    # over `shared_fraction` in {0.0, 0.1, 0.2, 0.3, 0.4, 0.5} (e.g. via subprocess or bash script).
+    # Then, you need a new evaluation pipeline here:
+    # Instead of (or in addition to) `run_full_analysis()` which fixes shared_fraction and sweeps omegas, 
+    # ============================================================
+    # PHASE 2: COORDINATION SWEEP (RQ3)
+    # ============================================================
+    
+    def run_coordination_sweep(omegas=[0.2, 0.4], shared_fractions=[0.0, 0.1, 0.2, 0.3, 0.4, 0.5]):
+        """Evaluates policies across multiple shared fractions for fixed omegas."""
+        global SHARED_FRACTION
+        
+        families = build_scenarios()
+        coord_results = {}
+        
+        # Nested loop: family -> omega -> shared_fraction
+        for fam, spec in families.items():
+            coord_results[fam] = {}
+            for omega in omegas:
+                coord_results[fam][omega] = {}
+                for sf in shared_fractions:
+                    coord_results[fam][omega][sf] = {}
+                    
+                    # Overwrite global SHARED_FRACTION so the environment and model loaders use the correct coupling
+                    SHARED_FRACTION = sf
+                    
+                    # Re-instantiate policies to ensure they load the model corresponding to the current SHARED_FRACTION
+                    policies = {"centralized":CentralizedPolicy(omega), "ctde":CTDEPolicy(omega)}
+                    
+                    for mname, policy in policies.items():
+                        if policy.available():    
+                            coord_results[fam][omega][sf][mname] = _eval_method(omega=omega, mname=mname, policy=policy, seeds=spec["seeds"][:K_SCENARIOS], risk=spec["risk"])
+                            
+        # Pass the final results dictionary to the plotting function
+        plot_coordination_sweep(coord_results)
+    
+    # ============================================================
+    # STEP 2: PLOTTING COORDINATION SWEEP
+    # ============================================================
+    def plot_coordination_sweep(coord_results, shared_fractions=[0.0, 0.1, 0.2, 0.3, 0.4, 0.5]):
+        """Plots the coordination value (reward) vs shared fraction."""
+        print(f"\nGenerating Coordination Sweep Plots...")
+        
+        # We will loop over every family and omega we evaluated to create separate plots
+        for fam, omegas_dict in coord_results.items():
+            for omega, sfs_dict in omegas_dict.items():
+                
+                fig, ax = plt.subplots(figsize=(10, 6))
+                
+                # Plot Centralized and CTDE (and any others you added)
+                for mname in ['centralized', 'ctde']:
+                    # Get styling config from the global LEAGUE dictionary
+                    label, league, color = LEAGUE[mname]
+                    means = []
+                    
+                    # Extract the mean reward for each shared fraction in order
+                    for sf in shared_fractions:
+                        res = sfs_dict.get(sf, {}).get(mname)
+                        if res is not None:
+                            means.append(res['mean'])
+                            
+                    # Plot the line for this model if we found data
+                    if means:
+                        ax.plot(shared_fractions[:len(means)], means, marker='o', label=label, color=color, linewidth=2)
+                        
+                # Style the plot
+                ax.set_xlabel('Coupling (Shared Fraction)', fontsize=12, fontweight='bold')
+                ax.set_ylabel('Mean Reward', fontsize=12, fontweight='bold')
+                ax.set_title(f"Coordination Value: {fam.capitalize()} Scenarios (Omega={omega})", fontsize=14)
+                ax.grid(True, linestyle='--', alpha=0.6)
+                plt.legend()
+                
+                # Save the plot
+                filename = f"coordination_sweep_{fam}_omega_{omega}.png"
+                plt.savefig(os.path.join(OUTPUT_DIR, filename), dpi=300, bbox_inches='tight')
+                plt.close()
+                print(f"  Saved plot: {filename}")
+
+    # ============================================================
+    # STEP 3: CONTROL EXECUTION FLOW
+    # ============================================================
+    
+    if args.limit_omega:
+        # Phase 2 (RQ3) Execution
+        print("Running Phase 2: Coordination Sweep...")
+        run_coordination_sweep()
+    else:
+        # Phase 1 Execution
+        print("Running Phase 1: Full Analysis...")
+        run_full_analysis()
+
     print("\n" + "=" * 80)
     print(f"ANALYSIS COMPLETE — results in {OUTPUT_DIR}/")
     print("=" * 80)
