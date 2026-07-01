@@ -501,7 +501,7 @@ def evaluate(families, omegas=OMEGA_VALUES, k=K_SCENARIOS, dp_k=DP_SCENARIOS):
             for s in dp_seeds:
                 # DP needs the exact risk path of this scenario
                 scen_risk = risk if risk is not None else _scenario_risk(s)
-                dp = DPUpperBound(omega, scen_risk)
+                dp = DPUpperBound(omega, scen_risk, num_classrooms=NUM_CLASSROOMS)
                 out = run_episode(omega, s, risk, dp)
                 by_seed[s] = out['reward']
                 traj_adm.append(out['admitted'])
@@ -610,7 +610,7 @@ def plot_rewards_by_league(results, fam, omegas=OMEGA_VALUES):
     ax.grid(True, linestyle='--', alpha=0.5)
     ax.legend(loc='best', fontsize=10)
     plt.tight_layout()
-    plt.savefig(os.path.join(OUTPUT_DIR, f"rewards_by_league_{fam}.png"), dpi=300, bbox_inches='tight')
+    plt.savefig(os.path.join(OUTPUT_DIR, f"rewards_by_league_{fam}_k_{NUM_CLASSROOMS}.png"), dpi=300, bbox_inches='tight')
     plt.close()
 
 
@@ -644,7 +644,7 @@ def plot_normalized_score(results, fam, omegas=OMEGA_VALUES):
     ax.grid(True, linestyle='--', alpha=0.5)
     ax.legend(loc='best', fontsize=10)
     plt.tight_layout()
-    plt.savefig(os.path.join(OUTPUT_DIR, f"normalized_score_{fam}.png"), dpi=300, bbox_inches='tight')
+    plt.savefig(os.path.join(OUTPUT_DIR, f"normalized_score_{fam}_k_{NUM_CLASSROOMS}.png"), dpi=300, bbox_inches='tight')
     plt.close()
 
 
@@ -675,7 +675,7 @@ def plot_decomposition(decomp, fam, omegas=OMEGA_VALUES):
     ax.grid(True, linestyle='--', alpha=0.5)
     ax.legend(loc='best', fontsize=10)
     plt.tight_layout()
-    plt.savefig(os.path.join(OUTPUT_DIR, f"decomposition_{fam}.png"), dpi=300, bbox_inches='tight')
+    plt.savefig(os.path.join(OUTPUT_DIR, f"decomposition_{fam}_k_{NUM_CLASSROOMS}.png"), dpi=300, bbox_inches='tight')
     plt.close()
 
 
@@ -703,7 +703,7 @@ def plot_reward_terms(results, fam, omegas=OMEGA_VALUES):
     axes[0].legend(loc='best', fontsize=9)
     fig.suptitle(f'Reward terms vs ω — {fam}', fontsize=13, fontweight='bold')
     plt.tight_layout()
-    plt.savefig(os.path.join(OUTPUT_DIR, f"reward_terms_{fam}.png"), dpi=300, bbox_inches='tight')
+    plt.savefig(os.path.join(OUTPUT_DIR, f"reward_terms_{fam}_k_{NUM_CLASSROOMS}.png"), dpi=300, bbox_inches='tight')
     plt.close()
 
 
@@ -736,7 +736,7 @@ def plot_trajectories(results, fam, omegas=OMEGA_VALUES):
     fig.suptitle(f'Behavior over time — {fam}  (admitted = utility, infected = cost)',
                  fontsize=13, fontweight='bold')
     plt.tight_layout(rect=[0, 0.02, 1, 1])
-    plt.savefig(os.path.join(OUTPUT_DIR, f"trajectories_{fam}.png"), dpi=300, bbox_inches='tight')
+    plt.savefig(os.path.join(OUTPUT_DIR, f"trajectories_{fam}_k_{NUM_CLASSROOMS}.png"), dpi=300, bbox_inches='tight')
     plt.close()
 
 
@@ -761,7 +761,7 @@ def save_outputs(results, decomp, omegas=OMEGA_VALUES):
                 row[f'{key}_p'] = d['p_value'] if d else np.nan
             rows.append(row)
     df = pd.DataFrame(rows)
-    df.to_csv(os.path.join(OUTPUT_DIR, "diagnostic_results.csv"), index=False)
+    df.to_csv(os.path.join(OUTPUT_DIR, f"diagnostic_results_k_{NUM_CLASSROOMS}.csv"), index=False)
 
     # JSON (drop per-seed/per-week bulk; keep summaries + decompositions)
     out = {}
@@ -777,174 +777,37 @@ def save_outputs(results, decomp, omegas=OMEGA_VALUES):
                 }
             for key, d in decomp[fam][o].items():
                 out[fam][str(o)]['decomp'][key] = d
-    with open(os.path.join(OUTPUT_DIR, "diagnostic_results.json"), 'w') as f:
+    with open(os.path.join(OUTPUT_DIR, f"diagnostic_results_k_{NUM_CLASSROOMS}.json"), 'w') as f:
         json.dump(out, f, indent=2)
-    print(f"\nSaved table + json to {OUTPUT_DIR}/")
-
-
-def print_summary(results, decomp, omegas=OMEGA_VALUES):
-    for fam in results:
-        print(f"\n{'=' * 78}\nSUMMARY — {fam} scenarios\n{'=' * 78}")
-        for o in omegas:
-            parts = []
-            for m in ALL_METHODS:
-                r = results[fam][o].get(m)
-                parts.append(f"{m}={r['mean']:.1f}" if r else f"{m}=NA")
-            print(f"omega={o}: " + ", ".join(parts))
-            d = decomp[fam][o].get('price_of_decentralization')
-            if d:
-                sig = "*" if d['p_value'] < 0.05 else ""
-                print(f"       price of decentralization (Cent-CTDE) = "
-                      f"{d['mean']:.1f} [{d['ci_lo']:.1f}, {d['ci_hi']:.1f}] p={d['p_value']:.3f}{sig}")
-
-
-# ============================================================
-# MAIN
-# ============================================================
-
-def run_full_analysis(k=K_SCENARIOS, dp_k=DP_SCENARIOS, omegas=OMEGA_VALUES):
-    print("=" * 80)
-    print("DIAGNOSTIC EVALUATION — Multi-Classroom Epidemic Control")
-    print(f"N={TOTAL_STUDENTS}, classrooms={NUM_CLASSROOMS}, horizon={MAX_WEEKS}, K={k}, DP_subset={dp_k}")
-    print("=" * 80)
-
-    families = build_scenarios(k)
-    results = evaluate(families, omegas=omegas, k=k, dp_k=dp_k)
-    decomp = compute_decompositions(results)
-
-    for fam in results:
-        plot_rewards_by_league(results, fam, omegas)
-        plot_normalized_score(results, fam, omegas)
-        plot_decomposition(decomp, fam, omegas)
-        plot_reward_terms(results, fam, omegas)
-        plot_trajectories(results, fam, omegas)
-
-    print_summary(results, decomp, omegas)
-    save_outputs(results, decomp, omegas)
-    return results, decomp
-
-
-if __name__ == '__main__':
-
-
-    parser = argparse.ArgumentParser()
-
-    parser.add_argument(
-        "--num_classrooms",
-        type = int,
-        default = 2,
-        help = "Number of classrooms used in experiment (default:2)"
-    )
-
-    parser.add_argument(
-        "--shared_fraction",
-        type = float,
-        default = 0.3,
-        help = "Controls how connected the classrooms are lower is isolated, higher has a risk of spillover (default:0.3)"
-    )
-
-    parser.add_argument(
-        "--limit_omega",
-        action="store_true",
-        help = "If flag included restricts omega values to [0.2, 0.4] for faster training (default:False)"
-    )
-
-    args = parser.parse_args()
-
-    SHARED_FRACTION = args.shared_fraction
-    NUM_CLASSROOMS = args.num_classrooms
-    
-    # TODO (Phase 2 - RQ3): Write a script or loop to execute the trainers
-    # over `shared_fraction` in {0.0, 0.1, 0.2, 0.3, 0.4, 0.5} (e.g. via subprocess or bash script).
-    # Then, you need a new evaluation pipeline here:
-    # Instead of (or in addition to) `run_full_analysis()` which fixes shared_fraction and sweeps omegas, 
-    # ============================================================
-    # PHASE 2: COORDINATION SWEEP (RQ3)
-    # ============================================================
-    
-    def run_coordination_sweep(omegas=[0.2, 0.4], shared_fractions=[0.0, 0.1, 0.2, 0.3, 0.4, 0.5]):
-        """Evaluates policies across multiple shared fractions for fixed omegas."""
-        global SHARED_FRACTION
         
-        families = build_scenarios()
-        coord_results = {}
-        
-        # Nested loop: family -> omega -> shared_fraction
-        for fam, spec in families.items():
-            coord_results[fam] = {}
-            for omega in omegas:
-                coord_results[fam][omega] = {}
-                for sf in shared_fractions:
-                    coord_results[fam][omega][sf] = {}
-                    
-                    # Overwrite global SHARED_FRACTION so the environment and model loaders use the correct coupling
-                    SHARED_FRACTION = sf
-                    
-                    # Re-instantiate policies to ensure they load the model corresponding to the current SHARED_FRACTION
-                    policies = {"centralized":CentralizedPolicy(omega), "ctde":CTDEPolicy(omega)}
-                    
-                    for mname, policy in policies.items():
-                        if policy.available():    
-                            coord_results[fam][omega][sf][mname] = _eval_method(omega=omega, mname=mname, policy=policy, seeds=spec["seeds"][:K_SCENARIOS], risk=spec["risk"])
-                            
-        # Pass the final results dictionary to the plotting function
-        plot_coordination_sweep(coord_results)
-    
-    # ============================================================
-    # STEP 2: PLOTTING COORDINATION SWEEP
-    # ============================================================
-    def plot_coordination_sweep(coord_results, shared_fractions=[0.0, 0.1, 0.2, 0.3, 0.4, 0.5]):
-        """Plots the coordination value (reward) vs shared fraction."""
-        print(f"\nGenerating Coordination Sweep Plots...")
-        
-        # We will loop over every family and omega we evaluated to create separate plots
-        for fam, omegas_dict in coord_results.items():
-            for omega, sfs_dict in omegas_dict.items():
-                
-                fig, ax = plt.subplots(figsize=(10, 6))
-                
-                # Plot Centralized and CTDE (and any others you added)
-                for mname in ['centralized', 'ctde']:
-                    # Get styling config from the global LEAGUE dictionary
-                    label, league, color = LEAGUE[mname]
-                    means = []
-                    
-                    # Extract the mean reward for each shared fraction in order
-                    for sf in shared_fractions:
-                        res = sfs_dict.get(sf, {}).get(mname)
-                        if res is not None:
-                            means.append(res['mean'])
-                            
-                    # Plot the line for this model if we found data
-                    if means:
-                        ax.plot(shared_fractions[:len(means)], means, marker='o', label=label, color=color, linewidth=2)
-                        
-                # Style the plot
-                ax.set_xlabel('Coupling (Shared Fraction)', fontsize=12, fontweight='bold')
-                ax.set_ylabel('Mean Reward', fontsize=12, fontweight='bold')
-                ax.set_title(f"Coordination Value: {fam.capitalize()} Scenarios (Omega={omega})", fontsize=14)
-                ax.grid(True, linestyle='--', alpha=0.6)
-                plt.legend()
-                
-                # Save the plot
-                filename = f"coordination_sweep_{fam}_omega_{omega}.png"
-                plt.savefig(os.path.join(OUTPUT_DIR, filename), dpi=300, bbox_inches='tight')
-                plt.close()
-                print(f"  Saved plot: {filename}")
-
-    # ============================================================
-    # STEP 3: CONTROL EXECUTION FLOW
-    # ============================================================
-    
-    if args.limit_omega:
-        # Phase 2 (RQ3) Execution
-        print("Running Phase 2: Coordination Sweep...")
-        run_coordination_sweep()
-    else:
-        # Phase 1 Execution
-        print("Running Phase 1: Full Analysis...")
-        run_full_analysis()
-
     print("\n" + "=" * 80)
     print(f"ANALYSIS COMPLETE — results in {OUTPUT_DIR}/")
     print("=" * 80)
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Run diagnostic evaluation for multi-classroom environment.")
+    parser.add_argument("--num_classrooms", type=int, default=NUM_CLASSROOMS, help="Number of classrooms (K)")
+    args = parser.parse_args()
+
+    # Update global variable so it's used dynamically everywhere
+    NUM_CLASSROOMS = args.num_classrooms
+
+    print(f"Starting diagnostic evaluation for K={NUM_CLASSROOMS} classrooms...")
+    families = build_scenarios()
+    
+    # Run evaluation
+    results = evaluate(families)
+    
+    # Compute decompositions
+    decomp = compute_decompositions(results)
+    
+    # Generate all plots
+    for fam in families:
+        plot_rewards_by_league(results, fam)
+        plot_normalized_score(results, fam)
+        plot_decomposition(decomp, fam)
+        plot_reward_terms(results, fam)
+        plot_trajectories(results, fam)
+        
+    # Save CSV and JSON
+    save_outputs(results, decomp)
