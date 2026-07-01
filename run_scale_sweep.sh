@@ -7,6 +7,7 @@
 # sizes of K (number of classrooms) to test Hypothesis 4.
 # ==============================================================================
 
+export CUDA_VISIBLE_DEVICES=""
 K_VALUES=(2 3 5)
 
 for K in "${K_VALUES[@]}"; do
