@@ -14,9 +14,9 @@ for K in "${K_VALUES[@]}"; do
     echo "Running Sweep for K = $K"
     echo "=========================================================="
 
-    python ppo_centralized.py --num_classrooms $K
-    python ppo_ctde.py --num_classrooms $K
-    python analyze_environment.py --num_classrooms $K
+    python3 ppo_centralized.py --num_classrooms $K
+    python3 ppo_ctde.py --num_classrooms $K
+    python3 analyze_environment.py --num_classrooms $K
 done
 
 echo "Sweep complete!"
