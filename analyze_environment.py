@@ -495,20 +495,24 @@ def evaluate(families, omegas=OMEGA_VALUES, k=K_SCENARIOS, dp_k=DP_SCENARIOS):
                 results[fam][omega][mname] = _eval_method(omega, mname, policy, seeds, risk)
 
             # DP: per-scenario solve on a subset (expensive)
-            dp_seeds = seeds[:dp_k]
-            by_seed, traj_adm, traj_inf = {}, [], []
-            t0 = time.time()
-            for s in dp_seeds:
-                # DP needs the exact risk path of this scenario
-                scen_risk = risk if risk is not None else _scenario_risk(s)
-                dp = DPUpperBound(omega, scen_risk, num_classrooms=NUM_CLASSROOMS)
-                out = run_episode(omega, s, risk, dp)
-                by_seed[s] = out['reward']
-                traj_adm.append(out['admitted'])
-                traj_inf.append(out['infected'])
-            results[fam][omega]['dp'] = _summarize(by_seed, traj_adm, traj_inf)
-            print(f"  {LEAGUE['dp'][0]:<24}: {results[fam][omega]['dp']['mean']:.1f} "
-                  f"(subset n={len(dp_seeds)}, {time.time() - t0:.0f}s)")
+            if NUM_CLASSROOMS <= 2:
+                dp_seeds = seeds[:dp_k]
+                by_seed, traj_adm, traj_inf = {}, [], []
+                t0 = time.time()
+                for s in dp_seeds:
+                    # DP needs the exact risk path of this scenario
+                    scen_risk = risk if risk is not None else _scenario_risk(s)
+                    dp = DPUpperBound(omega, scen_risk, num_classrooms=NUM_CLASSROOMS)
+                    out = run_episode(omega, s, risk, dp)
+                    by_seed[s] = out['reward']
+                    traj_adm.append(out['admitted'])
+                    traj_inf.append(out['infected'])
+                results[fam][omega]['dp'] = _summarize(by_seed, traj_adm, traj_inf)
+                print(f"  {LEAGUE['dp'][0]:<24}: {results[fam][omega]['dp']['mean']:.1f} "
+                      f"(subset n={len(dp_seeds)}, {time.time() - t0:.0f}s)")
+            else:
+                print(f"  {LEAGUE['dp'][0]:<24}: Skipped (computationally intractable for K > 2)")
+                results[fam][omega]['dp'] = None
 
     return results
 
@@ -618,16 +622,27 @@ def plot_normalized_score(results, fam, omegas=OMEGA_VALUES):
     """Fraction of full-info optimal recovered: (return - Random)/(DP - Random)."""
     x, xlabels = _omega_x(omegas)
     fig, ax = plt.subplots(figsize=(10, 6))
+    ceiling_label = 'DP optimal'
+    
     for mname in ['centralized', 'joint_myopic', 'ctde', 'dec_myopic']:
         label, league, color = LEAGUE[mname]
         xs, ys = [], []
         for i, o in enumerate(omegas):
             r = results[fam][o].get(mname)
             dp = results[fam][o].get('dp')
+            jm = results[fam][o].get('joint_myopic')
             rnd = results[fam][o].get('random')
-            if r is None or dp is None or rnd is None:
+            if r is None or rnd is None:
                 continue
-            denom = dp['mean'] - rnd['mean']
+                
+            if dp is not None:
+                denom = dp['mean'] - rnd['mean']
+            elif jm is not None:
+                denom = jm['mean'] - rnd['mean']
+                ceiling_label = 'Joint Myopic ceiling'
+            else:
+                continue
+                
             if abs(denom) < 1e-9:
                 continue
             xs.append(i); ys.append((r['mean'] - rnd['mean']) / denom)
@@ -635,10 +650,10 @@ def plot_normalized_score(results, fam, omegas=OMEGA_VALUES):
             continue
         ls = '-' if league == 'full_info' else '--'
         ax.plot(xs, ys, ls, marker='o', color=color, label=label, linewidth=2.2)
-    ax.axhline(1.0, color='gold', linestyle=':', alpha=0.7, label='DP optimal')
+    ax.axhline(1.0, color='gold', linestyle=':', alpha=0.7, label=ceiling_label)
     ax.axhline(0.0, color='gray', linestyle=':', alpha=0.7, label='Random floor')
     ax.set_xticks(x); ax.set_xticklabels(xlabels)
-    ax.set_xlabel('Omega (ω)'); ax.set_ylabel('Fraction of full-info optimal')
+    ax.set_xlabel('Omega (ω)'); ax.set_ylabel(f'Fraction of {ceiling_label.replace(" ceiling", "").replace(" optimal", "")} optimal')
     ax.set_title(f'Fraction of full-info optimal recovered — {fam}\n'
                  '(local-info shortfall includes the price of decentralization)', fontsize=12)
     ax.grid(True, linestyle='--', alpha=0.5)
