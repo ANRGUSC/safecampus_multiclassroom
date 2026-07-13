@@ -64,8 +64,9 @@ HIDDEN_DIM_CANDIDATES = [32, 64, 128]
 OMEGA_VALUES = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6]
 
 # Environment Settings
-TOTAL_STUDENTS = 50
+TOTAL_POPULATION = 100
 NUM_CLASSROOMS = 2
+TOTAL_STUDENTS = TOTAL_POPULATION // NUM_CLASSROOMS
 COOPERATIVE_REWARD = True
 TUNE_SEED = 123
 SHARED_FRACTION = 0.3
@@ -857,8 +858,10 @@ def run_marl_session(omega, seed, lr, episodes, num_classrooms=NUM_CLASSROOMS,
 # 4. POLICY EXTRACTION FUNCTIONS
 # ============================================================
 
-def extract_policy_grid(mappo_agent, agent_idx=0, total_students=TOTAL_STUDENTS,
+def extract_policy_grid(mappo_agent, agent_idx=0, total_students=None,
                         grid_points=POLICY_GRID_POINTS):
+    if total_students is None:
+        total_students = TOTAL_STUDENTS
     """Extracts a policy grid from a specific agent's actor."""
     infected_vals = np.linspace(0, total_students, grid_points)
     risk_vals = np.linspace(0, 1, grid_points)
@@ -1048,7 +1051,7 @@ def train_and_evaluate_optimal(optimized_hyperparams, policy_type='gaussian', nu
             omega_rewards_runs.append(history)
 
             # Save model
-            model_path = os.path.join(MODEL_DIR, f"mappo_omega_{omega}_sf_{shared_fraction}_k_{num_classrooms}_hd_{hidden_dim}_run_{run}")
+            model_path = os.path.join(MODEL_DIR, f"mappo_omega_{omega}_sf_{shared_fraction}_k_{num_classrooms}_pop_{TOTAL_POPULATION}_hd_{hidden_dim}_run_{run}")
             mappo.save(model_path)
 
             if run == 0:
@@ -1217,6 +1220,13 @@ if __name__ == '__main__':
     )
 
     parser.add_argument(
+        "--total_population",
+        type = int,
+        default = 100,
+        help = "Total population across all classrooms (default:100)"
+    )
+
+    parser.add_argument(
         "--shared_fraction",
         type = float,
         default = SHARED_FRACTION,
@@ -1230,6 +1240,9 @@ if __name__ == '__main__':
     )
 
     args = parser.parse_args()
+
+    TOTAL_POPULATION = args.total_population
+    TOTAL_STUDENTS = TOTAL_POPULATION // args.num_classrooms
 
     main(mode='tune_and_train', policy_type='beta', num_classrooms = args.num_classrooms, shared_fraction=args.shared_fraction, limit_omega=args.limit_omega)
 

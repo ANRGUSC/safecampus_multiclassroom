@@ -57,8 +57,9 @@ OUTPUT_DIR = "analysis_results"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # Shared environment config (must match the trainers)
-TOTAL_STUDENTS = 50
+TOTAL_POPULATION = 100
 NUM_CLASSROOMS = 2
+TOTAL_STUDENTS = TOTAL_POPULATION // NUM_CLASSROOMS
 MAX_WEEKS = 15
 COOPERATIVE_REWARD = True
 COMMUNITY_RISK_FILE = "weekly_risk_sample_b.csv"
@@ -80,7 +81,8 @@ SHARED_FRACTION = 0.3
 NUM_CLASSROOMS = 2
 
 # Shared configs (MUST MATCH TRAINING)
-TOTAL_STUDENTS = 50
+TOTAL_POPULATION = 100
+TOTAL_STUDENTS = TOTAL_POPULATION // NUM_CLASSROOMS
 
 # Bootstrap
 N_BOOT = 2000
@@ -288,13 +290,13 @@ class CTDEPolicy:
 # ---- trained-model loaders (graceful: return None if not found) ----
 
 # Awesome, you perfectly updated the path resolution!
-def _resolve_model_path(results_dir, prefix, omega, shared_fraction=SHARED_FRACTION, num_classrooms=NUM_CLASSROOMS):
+def _resolve_model_path(results_dir, prefix, omega, shared_fraction=SHARED_FRACTION, num_classrooms=NUM_CLASSROOMS, total_population=100):
     model_dir = os.path.join(results_dir, "models")
     if not os.path.exists(model_dir):
         return None
         
-    # Search for the newly named models: {prefix}_omega_{omega}_sf_{shared_fraction}_k_{num_classrooms}_hd_{anything}_run_0.pt
-    search_prefix = f"{prefix}_omega_{omega}_sf_{shared_fraction}_k_{num_classrooms}_hd_"
+    # Search for the newly named models: {prefix}_omega_{omega}_sf_{shared_fraction}_k_{num_classrooms}_pop_{total_population}_hd_{anything}_run_0.pt
+    search_prefix = f"{prefix}_omega_{omega}_sf_{shared_fraction}_k_{num_classrooms}_pop_{total_population}_hd_"
     for filename in os.listdir(model_dir):
         if filename.startswith(search_prefix) and filename.endswith("_run_0.pt"):
             return os.path.join(model_dir, filename[:-3])  # Strip the .pt extension for the loader
@@ -308,7 +310,7 @@ def _load_centralized(omega):
     try:
         # pyrefly: ignore [missing-import]
         from ppo_centralized import CentralizedPPO
-        path = _resolve_model_path("centralized_ppo_results", "centralized", omega, shared_fraction=SHARED_FRACTION, num_classrooms=NUM_CLASSROOMS)
+        path = _resolve_model_path("centralized_ppo_results", "centralized", omega, shared_fraction=SHARED_FRACTION, num_classrooms=NUM_CLASSROOMS, total_population=TOTAL_POPULATION)
         if path is None:
             return None
         return CentralizedPPO.load(path)
@@ -329,7 +331,7 @@ def _load_ctde(omega):
                 continue
         if mod is None:
             return None, None
-        path = _resolve_model_path("mappo_results", "mappo", omega, shared_fraction=SHARED_FRACTION, num_classrooms=NUM_CLASSROOMS)
+        path = _resolve_model_path("mappo_results", "mappo", omega, shared_fraction=SHARED_FRACTION, num_classrooms=NUM_CLASSROOMS, total_population=TOTAL_POPULATION)
         if path is None:
             return None, None
         return mod.MAPPO_CTDE.load(path), mod.normalize_state
@@ -502,7 +504,7 @@ def evaluate(families, omegas=OMEGA_VALUES, k=K_SCENARIOS, dp_k=DP_SCENARIOS):
                 for s in dp_seeds:
                     # DP needs the exact risk path of this scenario
                     scen_risk = risk if risk is not None else _scenario_risk(s)
-                    dp = DPUpperBound(omega, scen_risk, num_classrooms=NUM_CLASSROOMS)
+                    dp = DPUpperBound(omega, scen_risk, num_classrooms=NUM_CLASSROOMS, total_students=TOTAL_STUDENTS)
                     out = run_episode(omega, s, risk, dp)
                     by_seed[s] = out['reward']
                     traj_adm.append(out['admitted'])
@@ -751,7 +753,7 @@ def plot_trajectories(results, fam, omegas=OMEGA_VALUES):
     fig.suptitle(f'Behavior over time — {fam}  (admitted = utility, infected = cost)',
                  fontsize=13, fontweight='bold')
     plt.tight_layout(rect=[0, 0.02, 1, 1])
-    plt.savefig(os.path.join(OUTPUT_DIR, f"trajectories_{fam}_k_{NUM_CLASSROOMS}.png"), dpi=300, bbox_inches='tight')
+    plt.savefig(os.path.join(OUTPUT_DIR, f"trajectories_{fam}_pop_{TOTAL_POPULATION}_k_{NUM_CLASSROOMS}.png"), dpi=300, bbox_inches='tight')
     plt.close()
 
 
@@ -776,7 +778,7 @@ def save_outputs(results, decomp, omegas=OMEGA_VALUES):
                 row[f'{key}_p'] = d['p_value'] if d else np.nan
             rows.append(row)
     df = pd.DataFrame(rows)
-    df.to_csv(os.path.join(OUTPUT_DIR, f"diagnostic_results_k_{NUM_CLASSROOMS}.csv"), index=False)
+    df.to_csv(os.path.join(OUTPUT_DIR, f"diagnostic_results_pop_{TOTAL_POPULATION}_k_{NUM_CLASSROOMS}.csv"), index=False)
 
     # JSON (drop per-seed/per-week bulk; keep summaries + decompositions)
     out = {}
@@ -792,7 +794,7 @@ def save_outputs(results, decomp, omegas=OMEGA_VALUES):
                 }
             for key, d in decomp[fam][o].items():
                 out[fam][str(o)]['decomp'][key] = d
-    with open(os.path.join(OUTPUT_DIR, f"diagnostic_results_k_{NUM_CLASSROOMS}.json"), 'w') as f:
+    with open(os.path.join(OUTPUT_DIR, f"diagnostic_results_pop_{TOTAL_POPULATION}_k_{NUM_CLASSROOMS}.json"), 'w') as f:
         json.dump(out, f, indent=2)
         
     print("\n" + "=" * 80)
@@ -802,12 +804,15 @@ def save_outputs(results, decomp, omegas=OMEGA_VALUES):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run diagnostic evaluation for multi-classroom environment.")
     parser.add_argument("--num_classrooms", type=int, default=NUM_CLASSROOMS, help="Number of classrooms (K)")
+    parser.add_argument("--total_population", type=int, default=100, help="Total population across all classrooms")
     args = parser.parse_args()
 
-    # Update global variable so it's used dynamically everywhere
+    # Update global variables so they're used dynamically everywhere
     NUM_CLASSROOMS = args.num_classrooms
+    TOTAL_POPULATION = args.total_population
+    TOTAL_STUDENTS = TOTAL_POPULATION // NUM_CLASSROOMS
 
-    print(f"Starting diagnostic evaluation for K={NUM_CLASSROOMS} classrooms...")
+    print(f"Starting diagnostic evaluation for Pop={TOTAL_POPULATION}, K={NUM_CLASSROOMS} classrooms...")
     families = build_scenarios()
     
     # Run evaluation
