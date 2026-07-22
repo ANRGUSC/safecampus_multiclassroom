@@ -1,6 +1,10 @@
+# pyrefly: ignore [missing-import]
 import numpy as np
+# pyrefly: ignore [missing-import]
 from pettingzoo.utils import ParallelEnv
+# pyrefly: ignore [missing-import]
 from gymnasium.spaces import Discrete, Box
+# pyrefly: ignore [missing-import]
 from environment.simulation import simulate_infections_n_classrooms
 import itertools
 import random

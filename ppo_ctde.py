@@ -1060,8 +1060,8 @@ def train_and_evaluate_optimal(optimized_hyperparams, policy_type='gaussian', nu
         all_rewards_matrix[omega] = np.array(omega_rewards_runs)
 
     # Plot results
-    plot_combined_rewards(all_rewards_matrix, NUM_RUNS)
-    plot_policy_strips(representative_agents)
+    plot_combined_rewards(all_rewards_matrix, NUM_RUNS, num_classrooms)
+    plot_policy_strips(representative_agents, num_classrooms)
 
     print(f"\nTraining complete. Models saved to {MODEL_DIR}")
 
@@ -1082,7 +1082,7 @@ def generate_distinct_colors(n):
     ]
 
 
-def plot_combined_rewards(all_rewards_matrix, num_runs):
+def plot_combined_rewards(all_rewards_matrix, num_runs, num_classrooms):
     """Plots combined smoothed training rewards."""
     print("\n--- Generating Combined Rewards Plot ---")
 
@@ -1114,17 +1114,17 @@ def plot_combined_rewards(all_rewards_matrix, num_runs):
     plt.margins(x=0)
     plt.xlabel("Episode", fontsize=14, fontweight='bold')
     plt.ylabel("Reward", fontsize=14, fontweight='bold')
-    plt.title("MAPPO (CTDE Beta) Training Reward", fontsize=14, fontweight='bold')
+    plt.title(f"MAPPO (CTDE Beta) Training Reward (K={num_classrooms})", fontsize=14, fontweight='bold')
     plt.legend(loc='upper center', bbox_to_anchor=(0.5, -0.15),
                ncol=len(OMEGA_VALUES), borderaxespad=0., fontsize=12, frameon=False)
     plt.grid(True, linestyle='--', alpha=0.6, linewidth=1.5)
     plt.tight_layout()
-    plt.savefig(os.path.join(OUTPUT_DIR, "combined_mappo_rewards_ci.png"),
+    plt.savefig(os.path.join(OUTPUT_DIR, f"combined_mappo_rewards_ci_k_{num_classrooms}.png"),
                 dpi=300, bbox_inches='tight', pad_inches=0.05)
     plt.close()
 
 
-def plot_policy_strips(representative_agents):
+def plot_policy_strips(representative_agents, num_classrooms):
     """Plots the optimal policy as a heatmap strip for each omega and each agent."""
     print("\n--- Generating Optimal Policy Strips Plot ---")
 
@@ -1165,7 +1165,7 @@ def plot_policy_strips(representative_agents):
     cbar.set_label('Action (Capacity Fraction)', rotation=270, labelpad=15)
 
     plt.tight_layout(rect=[0, 0, 0.9, 1])
-    plt.savefig(os.path.join(OUTPUT_DIR, "combined_mappo_optimal_policies.png"),
+    plt.savefig(os.path.join(OUTPUT_DIR, f"combined_mappo_optimal_policies_k_{num_classrooms}.png"),
                 dpi=300, bbox_inches='tight')
     plt.close()
 
