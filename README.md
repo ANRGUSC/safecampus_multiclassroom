@@ -113,18 +113,16 @@ Key knobs at the top of `analyze_environment.py`: `K_SCENARIOS` (paired eval sce
 safecampus_multiclassroom/
 ├── centralized_ppo_results/
 │   ├── models/centralized_omega_{ω}_hd_{hd}_run_0.pt
-│   ├── optimized_hyperparams.json
 │   └── training_rewards.png
 ├── mappo_results/
 │   ├── models/mappo_omega_{ω}_hd_{hd}_run_0.pt
-│   ├── optimized_hyperparams.json
 │   ├── combined_mappo_rewards_ci.png
 │   └── combined_mappo_optimal_policies.png
 └── analysis_results/
-    ├── diagnostic_results_pop_{pop}_k_{k}.csv
-    ├── diagnostic_results_pop_{pop}_k_{k}.json
     ├── performance_gap_scale_pop_{pop}.png
-    └── trajectories_synthetic_pop_{pop}_k_{k}.png
+    ├── trajectories_synthetic_pop_{pop}_k_{k}.png
+    ├── diagnostic_results_pop_{pop}_k_{k}.csv
+    └── diagnostic_results_pop_{pop}_k_{k}.json
 ```
 
 ## Notes
@@ -136,6 +134,5 @@ safecampus_multiclassroom/
   `2·K`-dimensional state, so any static heatmap would require fixing the other rooms at arbitrary
   values. Behavior is instead read from on-distribution rollouts in the analysis (`trajectories_*`).
 
-## Notes on this Branch
-
-- **Population and Scale Sweep Scripts:** This branch includes new bash scripts (`run_population_sweep.sh`, `run_scale_sweep.sh`) and a plotting script (`plot_k_gap.py`) which are not documented in the main README. These indicate that testing in this branch focuses on sweeping across different student populations and classroom sizes (K).
+**Branch Notes:**
+This branch is specifically configured for scaling experiments over population (`pop`) and number of classrooms (`k`). As a result, the `analysis_results` directory outputs parametric files containing `_pop_{pop}_k_{k}` in their names (such as `diagnostic_results_pop_100_k_2.csv` and `performance_gap_scale_pop_100.png`) rather than the default matched-information regime plots.

@@ -67,7 +67,7 @@ if __name__ == "__main__":
 
         ax.set_xlabel('Number of Classrooms (K)', fontweight='bold')
         ax.set_ylabel('Mean Joint Reward', fontweight='bold')
-        ax.set_title(rf'Risk Preference $\omega$ = {omega}')
+        ax.set_title(fr'Risk Preference $\omega$ = {omega}')
         ax.set_xticks(index + bar_width / 2)
         ax.set_xticklabels([f'K={k}' for k in k_vals])
         
@@ -79,7 +79,7 @@ if __name__ == "__main__":
             gap = ctde_means[j] - cent_means[j]
             # Only annotate if the gap is somewhat meaningful
             ax.text(index[j] + bar_width/2, max(cent_means[j], ctde_means[j]) + max(cent_err[j], ctde_err[j]) + (max(cent_means)*0.05),
-                    rf"$\Delta$: {gap:+.1f}", ha='center', va='bottom', fontsize=10, fontweight='bold', 
+                    fr"$\Delta$: {gap:+.1f}", ha='center', va='bottom', fontsize=10, fontweight='bold', 
                     color='red' if gap > 0 else 'black')
 
     plt.tight_layout(rect=[0, 0, 1, 0.95])
